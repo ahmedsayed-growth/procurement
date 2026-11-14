@@ -2657,22 +2657,27 @@ const TABLE_LABELS = {
   erp_payments:'الدفعات', erp_shipments:'الشحنات', erp_season_plan:'خطة الموسم',
   erp_attachments:'المرفقات', erp_samples:'العينات',
   erp_warehouse_receipts:'استلام المستودع', erp_warehouse_receipt_lines:'بنود استلام المستودع',
+  erp_profiles:'الحسابات', erp_accounts:'حذف حساب', erp_payment_comments:'تعليقات الدفعات',
 };
 function renderAudit(root){
   root.innerHTML = `
     <div class="card">
       <div class="toolbar"><strong>سجل التعديلات (آخر ${cache.audit.length} حركة)</strong>
-        <button class="btn small" id="exp-audit">تصدير إكسل</button>
+        <div class="row" style="flex:0;gap:8px">
+          <button class="btn small danger" id="del-audit" disabled>حذف المحدد (0)</button>
+          <button class="btn small" id="exp-audit">تصدير إكسل</button>
+        </div>
       </div>
       <div style="overflow:auto;max-height:65vh">
       <table>
-        <thead><tr><th>الوقت</th><th>الجدول</th><th>العملية</th><th>بواسطة</th><th></th></tr></thead>
+        <thead><tr><th><input type="checkbox" id="aud-all" title="تحديد الكل"></th><th>الوقت</th><th>الجدول</th><th>العملية</th><th>بواسطة</th><th></th></tr></thead>
         <tbody>
           ${cache.audit.map(a=>`
             <tr>
+              <td><input type="checkbox" class="aud-chk" data-id="${a.id}"></td>
               <td>${new Date(a.changed_at).toLocaleString('ar-SA')}</td>
               <td>${TABLE_LABELS[a.table_name]||a.table_name}</td>
-              <td>${({INSERT:'إضافة',UPDATE:'تعديل',DELETE:'حذف'})[a.action]||a.action}</td>
+              <td>${({INSERT:'إضافة',UPDATE:'تعديل',DELETE:'حذف',ACCOUNT_DELETE:'حذف حساب'})[a.action]||a.action}</td>
               <td>${userLabel(a.changed_by)}</td>
               <td><button class="btn small" data-id="${a.id}" data-act="view-audit">تفاصيل</button></td>
             </tr>`).join('')}
@@ -2681,6 +2686,19 @@ function renderAudit(root){
       </div>
     </div>
   `;
+  const delBtn = root.querySelector('#del-audit');
+  const selectedIds = () => [...root.querySelectorAll('.aud-chk:checked')].map(c=>Number(c.dataset.id));
+  const syncSel = () => { const n = selectedIds().length; delBtn.disabled = n===0; delBtn.textContent = `حذف المحدد (${n})`; };
+  root.querySelector('#aud-all').onchange = e => { root.querySelectorAll('.aud-chk').forEach(c=>c.checked = e.target.checked); syncSel(); };
+  root.querySelectorAll('.aud-chk').forEach(c=> c.onchange = syncSel);
+  delBtn.onclick = async () => {
+    const ids = selectedIds();
+    if (!ids.length) return;
+    if (!confirm(`حذف ${ids.length} حركة من سجل التعديلات؟\nتُنقل إلى أرشيف خاص بالمالك فقط (لا يراه غيرك) ولا تظهر هنا بعد الحذف.`)) return;
+    const { data, error } = await sb.rpc('erp_audit_delete', { p_ids: ids });
+    if (error) { toast('خطأ: '+error.message); return; }
+    toast(`تم حذف ${data} حركة من السجل`); await refreshAll(); renderActiveTab();
+  };
   root.querySelector('#exp-audit').onclick = () => exportToExcel(cache.audit.map(a=>({
     الوقت:a.changed_at, الجدول:a.table_name, العملية:a.action, بواسطة:userLabel(a.changed_by)
   })), 'audit_log');
