@@ -195,7 +195,7 @@ function emailFor(input){
 let currentUser = null;
 let currentProfile = null;
 let activeTab = 'dashboard';
-let cache = { suppliers:[], orders:[], lines:[], payments:[], shipments:[], season:[], profiles:[], audit:[], attachments:[], samples:[], warehouseReceipts:[], warehouseReceiptLines:[] };
+let cache = { suppliers:[], orders:[], lines:[], payments:[], shipments:[], season:[], profiles:[], audit:[], attachments:[], samples:[], warehouseReceipts:[], warehouseReceiptLines:[], paymentComments:[], financePayments:[] };
 let chartInstances = {};
 let selectedOrderIds = new Set();
 let dashFilter = { from:'', to:'', supplier:'', category:'' };
@@ -278,7 +278,7 @@ function showView(v){
 
 function renderWhoAmI(){
   document.getElementById('whoami').innerHTML = `
-    <span>${currentProfile.full_name || currentProfile.username} (${currentProfile.role})</span>
+    <span>${escHtml(currentProfile.full_name || currentProfile.username)} (${ROLE_LABELS[currentProfile.role]||currentProfile.role})</span>
     <button class="btn small" onclick="signOut()">خروج</button>
   `;
 }
@@ -287,7 +287,21 @@ function renderWhoAmI(){
 // DATA LOADING
 // ============================================================
 async function refreshAll(){
-  const [s,o,l,p,sh,sp,pr,au,at,sm,wr,wl] = await Promise.all([
+  const role = currentProfile.role;
+  // المالية: لا تقرأ أي جدول مباشرة — فقط الدفعات عبر دالة آمنة + التعليقات
+  if (role === 'finance') {
+    const [fp, pc] = await Promise.all([
+      sb.rpc('erp_finance_payments'),
+      sb.from('erp_payment_comments').select('*').order('created_at'),
+    ]);
+    if (fp.error) toast('تعذّر تحميل الدفعات: ' + fp.error.message);
+    cache.financePayments = Array.isArray(fp.data) ? fp.data : [];
+    cache.paymentComments = pc.data || [];
+    return;
+  }
+  const isOwner = role === 'owner';
+  const empty = Promise.resolve({ data: [] });
+  const [s,o,l,p,sh,sp,pr,au,at,sm,wr,wl,pc] = await Promise.all([
     sb.from('erp_suppliers').select('*').order('name'),
     sb.from('erp_purchase_orders').select('*').order('created_at',{ascending:false}),
     sb.from('erp_po_line_items').select('*').order('created_at'),
@@ -295,11 +309,12 @@ async function refreshAll(){
     sb.from('erp_shipments').select('*').order('created_at',{ascending:false}),
     sb.from('erp_season_plan').select('*').order('need_by_date'),
     sb.from('erp_profiles').select('*').order('username'),
-    sb.from('erp_audit_log').select('*').order('changed_at',{ascending:false}).limit(100),
+    isOwner ? sb.from('erp_audit_log').select('*').order('changed_at',{ascending:false}).limit(100) : empty,
     sb.from('erp_attachments').select('*').order('created_at',{ascending:false}),
     sb.from('erp_samples').select('*').order('created_at',{ascending:false}),
     sb.from('erp_warehouse_receipts').select('*').order('created_at',{ascending:false}),
     sb.from('erp_warehouse_receipt_lines').select('*').order('created_at'),
+    role === 'warehouse' ? empty : sb.from('erp_payment_comments').select('*').order('created_at'),
   ]);
   cache.suppliers = s.data||[];
   cache.orders = o.data||[];
@@ -313,6 +328,7 @@ async function refreshAll(){
   cache.samples = sm.data||[];
   cache.warehouseReceipts = wr.data||[];
   cache.warehouseReceiptLines = wl.data||[];
+  cache.paymentComments = pc.data||[];
 }
 
 function supplierName(id){ const s = cache.suppliers.find(x=>x.id===id); return s ? s.name : '—'; }
@@ -325,20 +341,24 @@ function receiptLinesFor(receiptId){ return cache.warehouseReceiptLines.filter(l
 // ============================================================
 // TAB SYSTEM
 // ============================================================
+const ALL_OPS = ['owner','editor','data_entry','viewer'];
 const TAB_DEFS = [
-  {id:'dashboard', label:'لوحة المؤشرات', icon:'📊', roles:['manager','data_entry','finance','viewer']},
-  {id:'orders', label:'أوامر الشراء', icon:'📋', roles:['manager','data_entry','finance','viewer']},
-  {id:'aging', label:'تقادم الأوامر', icon:'⏱️', roles:['manager','data_entry','finance','viewer']},
-  {id:'payments', label:'الدفعات', icon:'💰', roles:['manager','data_entry','finance','viewer']},
-  {id:'shipments', label:'الشحنات', icon:'🚢', roles:['manager','data_entry','finance','viewer','warehouse']},
-  {id:'season', label:'خطة الموسم', icon:'📅', roles:['manager','data_entry','viewer']},
-  {id:'suppliers', label:'الموردون', icon:'🏭', roles:['manager','data_entry','viewer']},
-  {id:'samples', label:'العينات', icon:'🧪', roles:['manager','data_entry','viewer']},
-  {id:'warehouse_receipts', label:'استلام المستودع', icon:'📥', roles:['manager','data_entry','finance','viewer','warehouse']},
-  {id:'comparison', label:'مقارنة الموردين', icon:'⚖️', roles:['manager','finance','viewer']},
-  {id:'audit', label:'سجل التعديلات', icon:'📝', roles:['manager']},
-  {id:'users', label:'المستخدمون', icon:'👥', roles:['manager']},
+  {id:'finance_payments', label:'الدفعات (المالية)', icon:'💳', roles:['finance']},
+  {id:'dashboard', label:'لوحة المؤشرات', icon:'📊', roles:ALL_OPS},
+  {id:'orders', label:'أوامر الشراء', icon:'📋', roles:ALL_OPS},
+  {id:'aging', label:'تقادم الأوامر', icon:'⏱️', roles:ALL_OPS},
+  {id:'payments', label:'الدفعات', icon:'💰', roles:ALL_OPS},
+  {id:'shipments', label:'الشحنات', icon:'🚢', roles:[...ALL_OPS,'warehouse']},
+  {id:'season', label:'خطة الموسم', icon:'📅', roles:ALL_OPS},
+  {id:'suppliers', label:'الموردون', icon:'🏭', roles:ALL_OPS},
+  {id:'samples', label:'العينات', icon:'🧪', roles:ALL_OPS},
+  {id:'warehouse_receipts', label:'استلام المستودع', icon:'📥', roles:[...ALL_OPS,'warehouse']},
+  {id:'comparison', label:'مقارنة الموردين', icon:'⚖️', roles:['owner','editor','viewer']},
+  {id:'audit', label:'سجل التعديلات', icon:'📝', roles:['owner']},
+  {id:'users', label:'المستخدمون', icon:'👥', roles:['owner']},
 ];
+const ROLE_LABELS = {owner:'المالك', editor:'محرر', data_entry:'مُدخل بيانات', finance:'المالية', viewer:'مشاهد', warehouse:'المستودع', pending:'قيد المراجعة'};
+function escHtml(v){ return String(v==null?'':v).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
 function renderTabs(){
   const root = document.getElementById('tabs');
@@ -349,14 +369,14 @@ function renderTabs(){
   });
 }
 
-function canWrite(){ return ['manager','data_entry'].includes(currentProfile.role); } // يضيف سجلات جديدة
-function canDelete(){ return currentProfile.role === 'manager'; }
-function canFullAccess(){ return currentProfile.is_full_access === true; }
-function canEditExisting(){ return currentProfile.role === 'manager'; } // تعديل سجل محفوظ — المدير فقط (ما عدا استلام المستودع تحت)
+function canWrite(){ return ['owner','editor','data_entry'].includes(currentProfile.role); } // يضيف سجلات جديدة
+function canDelete(){ return currentProfile.role === 'owner'; } // الحذف للمالك فقط
+function canFullAccess(){ return currentProfile.role === 'owner'; }
+function canEditExisting(){ return ['owner','editor'].includes(currentProfile.role); } // تعديل سجل محفوظ — المدير فقط (ما عدا استلام المستودع تحت)
 function canWarehouse(){ return currentProfile.role === 'warehouse'; }
 function canWriteReceipts(){ return canWrite() || canWarehouse(); } // إضافة استلام
 function canEditReceipts(){ return canEditExisting() || canWarehouse(); } // تعديل استلام محفوظ
-function ownsRow(row){ return row.created_by === currentUser.id || currentProfile.role === 'manager'; }
+function ownsRow(row){ return row.created_by === currentUser.id || ['owner','editor'].includes(currentProfile.role); }
 
 function renderActiveTab(){
   const root = document.getElementById('tab-content');
@@ -369,6 +389,7 @@ function renderActiveTab(){
     orders: renderOrders,
     aging: renderAging,
     payments: renderPayments,
+    finance_payments: renderFinancePayments,
     shipments: renderShipments,
     season: renderSeason,
     suppliers: renderSuppliers,
@@ -1635,11 +1656,127 @@ function renderAging(root){
 }
 
 // ============================================================
+// PAYMENT COMMENTS (shared) + FINANCE VIEW
+// ============================================================
+function commentsFor(paymentId){ return cache.paymentComments.filter(c=>c.payment_id===paymentId); }
+function commentsBlockHtml(paymentId, canAddComment){
+  const list = commentsFor(paymentId);
+  return `<div class="field" style="margin-top:12px" id="cm-block">
+    <label>💬 تعليقات المالية على الدفعة (${list.length})</label>
+    <div style="max-height:140px;overflow:auto;border:1px solid var(--border,#ddd);border-radius:8px;padding:6px 10px">
+      ${list.length ? list.map(c=>`<div style="padding:5px 0;border-bottom:1px dashed #e5e5e5"><div>${escHtml(c.body)}</div><div class="muted" style="font-size:12px">${escHtml(c.author_name||'—')} · ${new Date(c.created_at).toLocaleString('ar-SA')}</div></div>`).join('') : '<span class="muted">لا توجد تعليقات</span>'}
+    </div>
+    ${canAddComment ? `<div class="row" style="margin-top:6px"><input id="cm-text" maxlength="1000" placeholder="اكتب تعليقًا (مثال: الدفعة موقوفة لحين وصول الفاتورة)"><button class="btn small" id="cm-add" style="flex:0">إضافة</button></div>` : ''}
+  </div>`;
+}
+function wireCommentsBlock(root, paymentId, rerender){
+  const btn = root.querySelector('#cm-add');
+  if (!btn) return;
+  btn.onclick = async () => {
+    const body = (root.querySelector('#cm-text').value||'').trim();
+    if (!body) { toast('اكتب نص التعليق أولًا'); return; }
+    const { error } = await sb.from('erp_payment_comments').insert({ payment_id: paymentId, body });
+    if (error) { toast('خطأ: '+error.message); return; }
+    toast('تمت إضافة التعليق'); await refreshAll(); rerender();
+  };
+}
+
+let finFilter = { q:'', st:'unpaid' };
+function renderFinancePayments(root){
+  const all = cache.financePayments;
+  const paid = p => p.status === 'مُحوَّلة';
+  const q = finFilter.q.trim().toLowerCase();
+  const rows = all.filter(p=>{
+    if (finFilter.st==='unpaid' && paid(p)) return false;
+    if (finFilter.st==='paid' && !paid(p)) return false;
+    if (q && ![p.po_number,p.supplier_name,p.item_name,p.reference].some(v=>String(v||'').toLowerCase().includes(q))) return false;
+    return true;
+  });
+  const nUnpaid = all.filter(p=>!paid(p)).length;
+  root.innerHTML = `
+    <div class="card">
+      <div class="toolbar">
+        <strong>الدفعات — المالية (${rows.length} من ${all.length}) · غير مدفوعة: ${nUnpaid}</strong>
+        <div class="row" style="flex:0;gap:8px">
+          <select id="fin-st" style="width:auto"><option value="unpaid" ${finFilter.st==='unpaid'?'selected':''}>غير المدفوعة</option><option value="paid" ${finFilter.st==='paid'?'selected':''}>المدفوعة</option><option value="all" ${finFilter.st==='all'?'selected':''}>الكل</option></select>
+          <input id="fin-q" value="${escHtml(finFilter.q)}" placeholder="بحث: أمر / مورد / صنف" style="width:200px">
+        </div>
+      </div>
+      <div style="overflow:auto;max-height:65vh">
+      <table>
+        <thead><tr><th>مدفوعة؟</th><th>الأمر</th><th>المورد</th><th>الصنف</th><th>المبلغ</th><th>الاستحقاق</th><th>الحالة</th><th>تاريخ التحويل</th><th>💬</th><th></th></tr></thead>
+        <tbody>
+          ${rows.map(p=>{
+            const over = p.due_date && p.due_date < today && !paid(p);
+            const nc = commentsFor(p.id).length;
+            return `<tr style="${over?'background:var(--danger-light)':''}">
+              <td><input type="checkbox" class="fin-paid" data-id="${p.id}" ${paid(p)?'checked':''} style="width:20px;height:20px"></td>
+              <td>${escHtml(p.po_number||'—')}</td><td>${escHtml(p.supplier_name||'—')}</td><td>${escHtml(p.item_name||'—')}</td>
+              <td>${fmtNum(p.amount)} ${escHtml(p.currency||'')}</td>
+              <td>${fmtDate(p.due_date)} ${over?'<span class="badge bad">متأخرة</span>':''}</td>
+              <td>${statusBadge(p.status)}</td><td>${fmtDate(p.transferred_date)}</td>
+              <td>${nc||''}</td>
+              <td><button class="btn small" data-id="${p.id}" data-act="fin-view">عرض</button></td>
+            </tr>`;
+          }).join('') || '<tr><td colspan="10" class="muted" style="text-align:center;padding:20px">لا توجد دفعات</td></tr>'}
+        </tbody>
+      </table>
+      </div>
+    </div>`;
+  root.querySelector('#fin-st').onchange = e => { finFilter.st = e.target.value; renderFinancePayments(root); };
+  root.querySelector('#fin-q').oninput = e => { finFilter.q = e.target.value; const pos = e.target.selectionStart; renderFinancePayments(root); const i = root.querySelector('#fin-q'); i.focus(); i.setSelectionRange(pos,pos); };
+  root.querySelectorAll('.fin-paid').forEach(cb=>{
+    cb.onchange = async () => {
+      const mark = cb.checked;
+      if (!confirm(mark ? 'تأكيد: تم تحويل هذه الدفعة؟ (سيُسجَّل تاريخ اليوم)' : 'إلغاء علامة "مدفوعة" لهذه الدفعة؟')) { cb.checked = !mark; return; }
+      await finSetPaid(cb.dataset.id, mark, null, ()=>renderActiveTab());
+    };
+  });
+  root.querySelectorAll('[data-act="fin-view"]').forEach(b=> b.onclick = () => openFinanceModal(b.dataset.id));
+}
+async function finSetPaid(id, mark, date, after){
+  const { error } = await sb.rpc('erp_finance_set_paid', { p_id: id, p_paid: mark, p_date: date });
+  if (error) { toast('خطأ: '+error.message); await refreshAll(); after&&after(); return; }
+  toast(mark ? 'تم تسجيل الدفعة كمدفوعة' : 'تم إلغاء علامة الدفع');
+  await refreshAll(); after&&after();
+}
+function openFinanceModal(id){
+  const p = cache.financePayments.find(x=>x.id===id);
+  if (!p) return;
+  const paid = p.status === 'مُحوَّلة';
+  const row = (k,v)=>`<tr><td class="muted" style="width:130px">${k}</td><td>${v}</td></tr>`;
+  openModal(`
+    <h3>تفاصيل الدفعة</h3>
+    <table><tbody>
+      ${row('أمر الشراء', escHtml(p.po_number||'—'))}${row('المورد', escHtml(p.supplier_name||'—'))}
+      ${row('الصنف / البند', escHtml(p.item_name||'—'))}${row('الفئة', escHtml(p.category||'—'))}
+      ${row('الكمية', p.quantity!=null?fmtNum(p.quantity):'—')}${row('رقم الدفعة', escHtml(p.payment_seq))}
+      ${row('المبلغ', `${fmtNum(p.amount)} ${escHtml(p.currency||'')}`)}${row('تاريخ الاستحقاق', fmtDate(p.due_date))}
+      ${row('الحالة', statusBadge(p.status))}${row('تاريخ التحويل', fmtDate(p.transferred_date))}
+      ${row('المرجع', escHtml(p.reference||'—'))}${row('ملاحظات', escHtml(p.notes||'—'))}
+    </tbody></table>
+    <div class="row" style="margin-top:12px;align-items:end">
+      <div class="field"><label>تاريخ التحويل الفعلي</label><input type="date" id="fm-date" value="${p.transferred_date||today}"></div>
+      <button class="btn ${paid?'':'primary'}" id="fm-toggle" style="flex:0;white-space:nowrap">${paid?'إلغاء علامة الدفع':'✔ تم الدفع'}</button>
+    </div>
+    ${commentsBlockHtml(p.id, true)}
+    <div class="row" style="margin-top:14px"><button class="btn" id="fm-close">إغلاق</button></div>
+  `, (root)=>{
+    root.querySelector('#fm-close').onclick = closeModal;
+    root.querySelector('#fm-toggle').onclick = async () => {
+      const d = root.querySelector('#fm-date').value || null;
+      await finSetPaid(p.id, !paid, d, ()=>{ closeModal(); renderActiveTab(); });
+    };
+    wireCommentsBlock(root, p.id, ()=>{ openFinanceModal(p.id); renderActiveTab(); });
+  });
+}
+
+// ============================================================
 // PAYMENTS
 // ============================================================
 function renderPayments(root){
   const canAdd = canWrite();
-  const canFinance = currentProfile.role === 'finance' || currentProfile.role === 'manager';
+  const canFinance = false; // المالية لها واجهة مستقلة
   root.innerHTML = `
     <div class="card">
       <div class="toolbar">
@@ -1695,7 +1832,7 @@ function statusBadge(s){
 
 function openPaymentModal(payment){
   const isEdit = !!payment;
-  const canFinance = currentProfile.role === 'finance' || currentProfile.role === 'manager';
+  const canFinance = false; // المالية لها واجهة مستقلة
   const editable = !isEdit ? canWrite() : (canEditExisting() || canFinance);
   const attachments = isEdit ? attachmentsFor('payment', payment.id) : [];
   openModal(`
@@ -1723,6 +1860,7 @@ function openPaymentModal(payment){
     <div class="field"><label>الحالة</label><select id="p-status">${['مستحقة','مطلوبة','مُعتمدة','مُحوَّلة'].map(s=>`<option ${payment?.status===s?'selected':''}>${s}</option>`).join('')}</select></div>
     <div class="field"><label>المرجع</label><input id="p-reference" value="${payment?.reference||''}"></div>
     ${isEdit ? renderAttachmentsBlock('payment', payment.id, attachments) : '<p class="muted" style="margin-top:8px">📎 اضغط "حفظ" أولاً — ستفتح النافذة تلقائيًا لإرفاق الملفات.</p>'}
+    ${isEdit ? commentsBlockHtml(payment.id, ['owner','editor'].includes(currentProfile.role)) : ''}
     <div class="row" style="margin-top:14px">
       <button class="btn primary" id="save-pay">حفظ</button>
       <button class="btn" id="cancel-pay">إغلاق</button>
@@ -1769,6 +1907,7 @@ function openPaymentModal(payment){
       toast('تم الحذف'); closeModal(); await refreshAll(); renderActiveTab();
     };
     if (isEdit) wireAttachmentsBlock(root, 'payment', payment.id, () => openPaymentModal(cache.payments.find(p=>p.id===payment.id)));
+    if (isEdit) wireCommentsBlock(root, payment.id, () => openPaymentModal(cache.payments.find(p=>p.id===payment.id)));
   });
 }
 
@@ -2561,33 +2700,27 @@ function renderAudit(root){
 function userLabel(id){ const p = cache.profiles.find(x=>x.id===id); return p ? (p.full_name||p.username) : (id||'—'); }
 
 // ============================================================
-// USERS (manager only)
+// USERS (owner only)
 // ============================================================
 function renderUsers(root){
-  const fullAccess = canFullAccess();
+  const ASSIGNABLE = ['pending','data_entry','editor','finance','viewer','warehouse'];
   root.innerHTML = `
     <div class="card">
       <strong>المستخدمون (${cache.profiles.length})</strong>
-      ${fullAccess ? '<p class="muted" style="margin-top:6px">صلاحية Full Access تتيح حذف أوامر الشراء (فرديًا أو جماعيًا). امنحها فقط لمن تثق به تمامًا.</p>' : ''}
+      <p class="muted" style="margin-top:6px">المالك وحده يمنح الأدوار ويحذف الحسابات ويرى سجل التعديلات. الحذف من النظام (أوامر/دفعات/…) للمالك فقط. دور "المالك" لا يُمنح ولا يُسحب من الواجهة.</p>
       <div style="overflow:auto;max-height:65vh;margin-top:10px">
       <table>
-        <thead><tr><th>الاسم</th><th>اسم المستخدم</th><th>الدور الحالي</th><th>تغيير الدور</th><th>Full Access</th></tr></thead>
+        <thead><tr><th>الاسم</th><th>اسم المستخدم</th><th>الدور الحالي</th><th>تغيير الدور</th><th></th></tr></thead>
         <tbody>
-          ${cache.profiles.map(p=>`
-            <tr>
-              <td>${p.full_name||'—'}</td><td>${p.username||'—'}</td>
-              <td>${p.role==='pending'?'<span class="badge warn">قيد المراجعة</span>':p.role}</td>
-              <td>
-                <select data-id="${p.id}" class="role-select" style="width:auto;display:inline-block">
-                  ${['pending','data_entry','manager','finance','viewer','warehouse'].map(r=>`<option value="${r}" ${p.role===r?'selected':''}>${r}</option>`).join('')}
-                </select>
-              </td>
-              <td>
-                ${fullAccess
-                  ? `<input type="checkbox" class="full-access-check" data-id="${p.id}" ${p.is_full_access?'checked':''}>`
-                  : (p.is_full_access ? '<span class="badge ok">✓</span>' : '<span class="muted">—</span>')}
-              </td>
-            </tr>`).join('')}
+          ${cache.profiles.map(p=>{
+            const isMe = p.id === currentUser.id, isOwnerRow = p.role === 'owner';
+            return `<tr>
+              <td>${escHtml(p.full_name||'—')}</td><td>${escHtml(p.username||'—')}</td>
+              <td>${p.role==='pending'?'<span class="badge warn">قيد المراجعة</span>':escHtml(ROLE_LABELS[p.role]||p.role)}</td>
+              <td>${isOwnerRow ? '<span class="muted">—</span>' : `<select data-id="${p.id}" class="role-select" style="width:auto;display:inline-block">
+                  ${ASSIGNABLE.map(r=>`<option value="${r}" ${p.role===r?'selected':''}>${ROLE_LABELS[r]}</option>`).join('')}</select>`}</td>
+              <td>${(isMe||isOwnerRow) ? '' : `<button class="btn small danger" data-id="${p.id}" data-name="${escHtml(p.username||p.full_name||'')}" data-act="del-user">حذف الحساب</button>`}</td>
+            </tr>`;}).join('')}
         </tbody>
       </table>
       </div>
@@ -2596,21 +2729,18 @@ function renderUsers(root){
   root.querySelectorAll('.role-select').forEach(sel=>{
     sel.onchange = async () => {
       const { error } = await sb.from('erp_profiles').update({role: sel.value}).eq('id', sel.dataset.id);
-      if (error) { toast('خطأ: '+error.message); return; }
+      if (error) { toast('خطأ: '+error.message); await refreshAll(); renderActiveTab(); return; }
       toast('تم تحديث الدور'); await refreshAll(); renderActiveTab();
     };
   });
-  if (fullAccess) {
-    root.querySelectorAll('.full-access-check').forEach(cb=>{
-      cb.onchange = async () => {
-        const grant = cb.checked;
-        if (grant && !confirm('منح صلاحية Full Access (حذف أوامر الشراء فرديًا/جماعيًا) لهذا المستخدم؟')) { cb.checked = false; return; }
-        const { error } = await sb.from('erp_profiles').update({is_full_access: grant}).eq('id', cb.dataset.id);
-        if (error) { toast('خطأ: '+error.message); cb.checked = !grant; return; }
-        toast(grant ? 'تم منح Full Access' : 'تم سحب Full Access'); await refreshAll(); renderActiveTab();
-      };
-    });
-  }
+  root.querySelectorAll('[data-act="del-user"]').forEach(b=>{
+    b.onclick = async () => {
+      if (!confirm(`حذف الحساب "${b.dataset.name}" نهائيًا؟\nلن يتمكن من الدخول مجددًا. سجلاته القديمة تبقى في النظام وفي سجل التعديلات. لا يمكن التراجع.`)) return;
+      const { error } = await sb.rpc('erp_delete_user', { p_id: b.dataset.id });
+      if (error) { toast('خطأ: '+error.message); return; }
+      toast('تم حذف الحساب'); await refreshAll(); renderActiveTab();
+    };
+  });
 }
 
 // ============================================================
