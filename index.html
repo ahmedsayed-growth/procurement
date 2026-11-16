@@ -62,6 +62,8 @@ tr:hover td{background:var(--primary-light)}
 .badge.bad{background:var(--danger-light);color:var(--danger)}
 .badge.info{background:var(--primary-light);color:var(--primary)}
 .muted{font-size:12px;color:var(--muted)}
+.sh-row{display:flex;gap:8px;align-items:center;margin-bottom:6px;flex-wrap:wrap}
+.sh-row input,.sh-row select{border:1px solid var(--border);border-radius:6px;padding:8px 10px;font-family:inherit;font-size:13px;background:var(--surface);color:var(--text);min-width:0}
 
 /* KPI Dashboard */
 .kpi-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px}
@@ -195,7 +197,7 @@ function emailFor(input){
 let currentUser = null;
 let currentProfile = null;
 let activeTab = 'dashboard';
-let cache = { suppliers:[], orders:[], lines:[], payments:[], shipments:[], season:[], profiles:[], audit:[], attachments:[], samples:[], warehouseReceipts:[], warehouseReceiptLines:[], paymentComments:[], financePayments:[] };
+let cache = { suppliers:[], orders:[], lines:[], payments:[], shipments:[], shipmentItems:[], shipmentContainers:[], season:[], profiles:[], audit:[], attachments:[], samples:[], warehouseReceipts:[], warehouseReceiptLines:[], paymentComments:[], financePayments:[] };
 let chartInstances = {};
 let selectedOrderIds = new Set();
 let dashFilter = { from:'', to:'', supplier:'', category:'' };
@@ -301,7 +303,7 @@ async function refreshAll(){
   }
   const isOwner = role === 'owner';
   const empty = Promise.resolve({ data: [] });
-  const [s,o,l,p,sh,sp,pr,au,at,sm,wr,wl,pc] = await Promise.all([
+  const [s,o,l,p,sh,sp,pr,au,at,sm,wr,wl,pc,si,sc] = await Promise.all([
     sb.from('erp_suppliers').select('*').order('name'),
     sb.from('erp_purchase_orders').select('*').order('created_at',{ascending:false}),
     sb.from('erp_po_line_items').select('*').order('created_at'),
@@ -315,12 +317,16 @@ async function refreshAll(){
     sb.from('erp_warehouse_receipts').select('*').order('created_at',{ascending:false}),
     sb.from('erp_warehouse_receipt_lines').select('*').order('created_at'),
     role === 'warehouse' ? empty : sb.from('erp_payment_comments').select('*').order('created_at'),
+    sb.from('erp_shipment_items').select('*').order('created_at'),
+    sb.from('erp_shipment_containers').select('*').order('created_at'),
   ]);
   cache.suppliers = s.data||[];
   cache.orders = o.data||[];
   cache.lines = l.data||[];
   cache.payments = p.data||[];
   cache.shipments = sh.data||[];
+  cache.shipmentItems = si.data||[];
+  cache.shipmentContainers = sc.data||[];
   cache.season = sp.data||[];
   cache.profiles = pr.data||[];
   cache.audit = au.data||[];
@@ -334,9 +340,110 @@ async function refreshAll(){
 function supplierName(id){ const s = cache.suppliers.find(x=>x.id===id); return s ? s.name : '—'; }
 function linesFor(poId){ return cache.lines.filter(l=>l.po_id===poId); }
 function paymentsFor(poId){ return cache.payments.filter(p=>p.po_id===poId); }
-function shipmentsFor(poId){ return cache.shipments.filter(s=>s.po_id===poId); }
+// ----- ربط الشحنة بالأوامر والحاويات والأصناف (شحنة واحدة قد تضم أكثر من أمر وحاوية وصنف) -----
+function splitContainers(t){ return [...new Set(String(t||'').split(/[\s,;،/]+/).map(x=>x.trim()).filter(Boolean))]; }
+function shipItems(shipId){ return cache.shipmentItems.filter(i=>i.shipment_id===shipId); }
+function shipContainers(shipId){ return cache.shipmentContainers.filter(c=>c.shipment_id===shipId); }
+function shipPoIds(s){
+  const ids = [...new Set(shipItems(s.id).map(i=>i.po_id).filter(Boolean))];
+  if (!ids.length && s.po_id) ids.push(s.po_id); // شحنات قديمة بدون أصناف
+  return ids;
+}
+function shipContainerList(s){
+  const l = shipContainers(s.id).map(c=>c.container_number).filter(Boolean);
+  return l.length ? l : splitContainers(s.container_number);
+}
+function shipTotalQty(s){
+  const it = shipItems(s.id);
+  return it.length ? it.reduce((a,i)=>a+(Number(i.quantity)||0),0) : s.total_quantity;
+}
+function shipPoNumbers(s){ return shipPoIds(s).map(id=>cache.orders.find(o=>o.id===id)?.po_number||'—'); }
+function shipSupplierNames(s){
+  return [...new Set(shipPoIds(s).map(id=>{ const o=cache.orders.find(x=>x.id===id); return o?supplierName(o.supplier_id):null; }).filter(Boolean))];
+}
+function shipLabel(s){ const c = shipContainerList(s); return c.length ? c.join(' / ') : 'بدون رقم حاوية'; }
+function shipmentsFor(poId){ return cache.shipments.filter(s=>shipPoIds(s).includes(poId)); }
 function attachmentsFor(entityType, entityId){ return cache.attachments.filter(a=>a.entity_type===entityType && a.entity_id===entityId); }
 function receiptLinesFor(receiptId){ return cache.warehouseReceiptLines.filter(l=>l.receipt_id===receiptId); }
+
+// ============================================================
+// BULK DELETE (للمالك فقط) — حذف المحدد / حذف الكل في القوائم
+// ============================================================
+const bulkSel = {};
+function bulkSet(key){ return bulkSel[key] || (bulkSel[key] = new Set()); }
+function bulkClean(key, list){
+  const live = new Set(list.map(x=>x.id)); const sel = bulkSet(key);
+  [...sel].forEach(id=>{ if(!live.has(id)) sel.delete(id); });
+}
+function bulkBarHtml(key, list){
+  if (!canFullAccess()) return '';
+  bulkClean(key, list);
+  const n = bulkSet(key).size;
+  return `<div class="toolbar" data-bulk-bar="${key}" style="background:var(--warn-light);border:1px solid var(--warn);border-radius:8px;padding:8px 12px;margin-top:8px">
+    <span style="font-size:13px">🔐 صلاحية المالك — <strong data-bulk-count>${n}</strong> محدد من ${list.length}</span>
+    <div class="row" style="flex:0;gap:8px">
+      <button class="btn small danger" data-bulk-del-selected ${n?'':'disabled'}>حذف المحدد</button>
+      <button class="btn small danger" data-bulk-del-all ${list.length?'':'disabled'}>حذف الكل (${list.length})</button>
+    </div></div>`;
+}
+function bulkThHtml(key, list){
+  if (!canFullAccess()) return '';
+  return `<th><input type="checkbox" data-bulk-all="${key}" ${list.length && bulkSet(key).size===list.length?'checked':''}></th>`;
+}
+function bulkTdHtml(key, id){
+  if (!canFullAccess()) return '';
+  return `<td><input type="checkbox" class="bulk-check" data-bulk="${key}" data-id="${id}" ${bulkSet(key).has(id)?'checked':''}></td>`;
+}
+// opts: { table, label (اسم المفرد), plural, attachType (اختياري: حذف مرفقات السجلات المحذوفة), note (تحذير إضافي) }
+function wireBulk(root, key, list, opts){
+  if (!canFullAccess()) return;
+  const sel = bulkSet(key);
+  const bar = root.querySelector(`[data-bulk-bar="${key}"]`);
+  if (!bar) return;
+  const delSel = bar.querySelector('[data-bulk-del-selected]');
+  const cnt = bar.querySelector('[data-bulk-count]');
+  const all = root.querySelector(`[data-bulk-all="${key}"]`);
+  const sync = () => {
+    cnt.textContent = sel.size; delSel.disabled = sel.size === 0;
+    if (all) all.checked = list.length > 0 && sel.size === list.length;
+  };
+  if (all) all.onchange = (e) => {
+    if (e.target.checked) list.forEach(x=>sel.add(x.id)); else sel.clear();
+    renderActiveTab();
+  };
+  root.querySelectorAll(`.bulk-check[data-bulk="${key}"]`).forEach(cb=>{
+    cb.onchange = () => { if (cb.checked) sel.add(cb.dataset.id); else sel.delete(cb.dataset.id); sync(); };
+  });
+  const run = async (ids) => {
+    for (let i=0; i<ids.length; i+=100) {
+      const { error } = await sb.from(opts.table).delete().in('id', ids.slice(i,i+100));
+      if (error) { toast('خطأ: '+error.message+(i?` (تم حذف ${i} قبل التوقف)`:'')); await refreshAll(); renderActiveTab(); return false; }
+    }
+    if (opts.attachType) {
+      try {
+        const idSet = new Set(ids);
+        const atts = cache.attachments.filter(a=>a.entity_type===opts.attachType && idSet.has(a.entity_id));
+        const paths = atts.map(a=>a.file_path).filter(Boolean);
+        if (paths.length) await sb.storage.from('erp-attachments').remove(paths);
+        if (atts.length) await sb.from('erp_attachments').delete().in('id', atts.map(a=>a.id));
+      } catch(e){ toast('تم الحذف، لكن تعذّر تنظيف بعض المرفقات: '+e.message); }
+    }
+    sel.clear();
+    toast(`تم حذف ${ids.length} ${opts.label}`); await refreshAll(); renderActiveTab();
+    return true;
+  };
+  delSel.onclick = async () => {
+    const ids = [...sel]; if (!ids.length) return;
+    if (!confirm(`حذف ${ids.length} ${opts.label} محدد؟ ${opts.note||''} لا يمكن التراجع.`)) return;
+    await run(ids);
+  };
+  bar.querySelector('[data-bulk-del-all]').onclick = async () => {
+    const ids = list.map(x=>x.id); if (!ids.length) return;
+    if (!confirm(`حذف جميع ${opts.plural} (${ids.length})؟ ${opts.note||''} هذا إجراء نهائي لا يمكن التراجع عنه.`)) return;
+    if (!confirm(`تأكيد أخير: سيتم حذف كل ${opts.plural} المعروضة الآن (${ids.length}). متابعة؟`)) return;
+    await run(ids);
+  };
+}
 
 // ============================================================
 // TAB SYSTEM
@@ -427,7 +534,7 @@ function renderDashboard(root){
     if (p.po_id) return scopedOrderIds.has(p.po_id);
     return !dashFilter.category; // payments with no linked PO have no category to match
   });
-  const fShipments = cache.shipments.filter(s=> s.po_id ? scopedOrderIds.has(s.po_id) : true);
+  const fShipments = cache.shipments.filter(s=>{ const ids = shipPoIds(s); return ids.length ? ids.some(id=>scopedOrderIds.has(id)) : true; });
   const dashLinesFor = (poId) => fLines.filter(l=>l.po_id===poId);
   const hasFilter = !!(dashFilter.from || dashFilter.to || dashFilter.supplier || dashFilter.category);
 
@@ -975,17 +1082,18 @@ function impBuildPlan(rows, db){
     const ref = resolvePo('shipments', r, true);
     const rec = { container_number:impText(r.container_number), shipping_line:impText(r.shipping_line), container_contents:impText(r.container_contents),
                   tracking_url:impText(r.tracking_url), status:impText(r.status), notes:impText(r.notes) };
+    const contList = splitContainers(rec.container_number);
     const tq = impNum(r.total_quantity); if (tq.err) E('shipments', r._row, `الكمية الإجمالية "${r.total_quantity}" غير صحيحة`); rec.total_quantity = tq.v;
     for (const f of IMP_SHIP_DATES) { const d = impDate(r[f]); if (d.err) E('shipments', r._row, `تاريخ "${r[f]}" غير صحيح (YYYY-MM-DD)`); rec[f] = d.v; }
     if (rec.tracking_url && !/^https?:\/\//i.test(rec.tracking_url)) E('shipments', r._row, 'رابط التتبع يجب أن يبدأ بـ http:// أو https://');
     if (errors.length > before || !ref) continue;
     if (ref.existing) {
-      if (rec.container_number && db.shipments.some(s => s.po_id === ref.existing.id && key(s.container_number) === key(rec.container_number))) {
+      if (contList.length && contList.every(c => db.shipments.some(s => shipPoIds(s).includes(ref.existing.id) && shipContainerList(s).some(x => key(x) === key(c))))) {
         plan.skippedDuplicates++; W('shipments', r._row, `الحاوية ${rec.container_number} مسجلة مسبقًا على الأمر ${ref.existing.po_number} — تم تجاهلها`); continue;
       }
       plan.existingPoLinked.add(ref.k);
     }
-    plan.shipments.push({ _poKey:ref.k, ...rec });
+    plan.shipments.push({ _poKey:ref.k, _containers:contList, ...rec });
   }
 
   // ---- الدفعات ----
@@ -1059,9 +1167,17 @@ async function impExecute(plan, client, userId, db){
     done.lines = plan.lines.length;
   }
   if (plan.shipments.length) {
-    const { error } = await client.from('erp_shipments').insert(plan.shipments.map(({ _poKey, ...s }) => ({ ...s, po_id:poId.get(_poKey).id, created_by:userId, updated_by:userId })));
+    const { data: shipData, error } = await client.from('erp_shipments').insert(plan.shipments.map(({ _poKey, _containers, ...s }) => ({ ...s, po_id:poId.get(_poKey).id, created_by:userId, updated_by:userId }))).select('id');
     if (error) throw fail('إضافة الشحنات', error);
     done.shipments = plan.shipments.length;
+    const cRows = [], iRows = [];
+    plan.shipments.forEach((s, i) => {
+      const sid = shipData[i].id;
+      (s._containers || []).forEach(n => cRows.push({ shipment_id:sid, container_number:n, created_by:userId }));
+      iRows.push({ shipment_id:sid, po_id:poId.get(s._poKey).id, item_name:s.container_contents, quantity:s.total_quantity, created_by:userId });
+    });
+    if (cRows.length) { const r = await client.from('erp_shipment_containers').insert(cRows); if (r.error) throw fail('إضافة حاويات الشحنات', r.error); }
+    if (iRows.length) { const r = await client.from('erp_shipment_items').insert(iRows); if (r.error) throw fail('إضافة أصناف الشحنات', r.error); }
   }
   if (plan.payments.length) {
     const { error } = await client.from('erp_payments').insert(plan.payments.map(({ _poKey, _supKey, ...p }) => {
@@ -1786,16 +1902,17 @@ function renderPayments(root){
           ${canAdd ? '<button class="btn primary small" id="add-pay">+ دفعة جديدة</button>' : ''}
         </div>
       </div>
+      ${bulkBarHtml('payments', cache.payments)}
       <div style="overflow:auto;max-height:60vh">
       <table>
-        <thead><tr><th>الأمر</th><th>المورد</th><th>الصنف</th><th>الفئة</th><th>الكمية</th><th>#</th><th>المبلغ</th><th>تاريخ الاستحقاق</th><th>الحالة</th><th>تاريخ التحويل</th><th></th></tr></thead>
+        <thead><tr>${bulkThHtml('payments', cache.payments)}<th>الأمر</th><th>المورد</th><th>الصنف</th><th>الفئة</th><th>الكمية</th><th>#</th><th>المبلغ</th><th>تاريخ الاستحقاق</th><th>الحالة</th><th>تاريخ التحويل</th><th></th></tr></thead>
         <tbody>
           ${cache.payments.map(p=>{
             const po = cache.orders.find(o=>o.id===p.po_id);
             const supName = p.supplier_id ? supplierName(p.supplier_id) : (po ? supplierName(po.supplier_id) : '—');
             const isOverdue = p.due_date && p.due_date < today && p.status!=='مُحوَّلة';
             return `<tr style="${isOverdue?'background:var(--danger-light)':''}">
-              <td>${po?po.po_number||'—':'—'}</td>
+              ${bulkTdHtml('payments', p.id)}<td>${po?po.po_number||'—':'—'}</td>
               <td>${supName}</td>
               <td>${p.item_name||'—'}</td>
               <td>${p.category||'—'}</td>
@@ -1822,6 +1939,7 @@ function renderPayments(root){
   root.querySelectorAll('[data-act="edit-pay"]').forEach(b=>{
     b.onclick = () => openPaymentModal(cache.payments.find(p=>p.id===b.dataset.id));
   });
+  wireBulk(root, 'payments', cache.payments, { table:'erp_payments', label:'دفعة', plural:'الدفعات', attachType:'payment', note:'(بتعليقاتها ومرفقاتها)' });
 }
 const today = new Date().toISOString().slice(0,10);
 
@@ -1922,35 +2040,38 @@ const SHIP_MILESTONES = [
 
 function renderShipments(root){
   const canAdd = canWrite();
+  const list = cache.shipments;
   root.innerHTML = `
     <div class="card">
       <div class="toolbar">
-        <strong>الشحنات (${cache.shipments.length})</strong>
+        <strong>الشحنات (${list.length})</strong>
         <div class="row" style="flex:0;gap:8px">
           <button class="btn small" id="exp-ship">تصدير إكسل</button>
           ${canAdd ? '<button class="btn primary small" id="add-ship">+ شحنة جديدة</button>' : ''}
         </div>
       </div>
+      ${bulkBarHtml('shipments', list)}
       <div style="overflow:auto;max-height:60vh">
       <table>
-        <thead><tr><th>الأمر</th><th>المورد</th><th>رقم الحاوية</th><th>شركة الشحن</th><th>تاريخ طلب الحاوية</th><th>الوصول المتوقع</th><th>الوصول الفعلي</th><th>الكمية الإجمالية</th><th>آخر محطة</th><th>الحالة</th><th>التتبع</th><th>تحديث بواسطة</th><th></th></tr></thead>
+        <thead><tr>${bulkThHtml('shipments', list)}<th>الأوامر</th><th>الموردون</th><th>الحاويات</th><th>شركة الشحن</th><th>تاريخ طلب الحاوية</th><th>الوصول المتوقع</th><th>الوصول الفعلي</th><th>الكمية الإجمالية</th><th>آخر محطة</th><th>الحالة</th><th>التتبع</th><th>تحديث بواسطة</th><th></th></tr></thead>
         <tbody>
-          ${cache.shipments.map(s=>{
-            const po = cache.orders.find(o=>o.id===s.po_id);
+          ${list.map(s=>{
             const lastDone = SHIP_MILESTONES.filter(m=>s[m[0]]).pop();
             const progress = SHIP_MILESTONES.filter(m=>s[m[0]]).length;
+            const pos = shipPoNumbers(s), sups = shipSupplierNames(s), cons = shipContainerList(s), qty = shipTotalQty(s), nItems = shipItems(s.id).length;
             return `<tr>
-              <td>${po?po.po_number||'—':'—'}</td>
-              <td>${po?supplierName(po.supplier_id):'—'}</td>
-              <td><strong>${s.container_number||'—'}</strong></td>
-              <td>${s.shipping_line||'—'}</td>
+              ${bulkTdHtml('shipments', s.id)}
+              <td>${pos.length?pos.map(escHtml).join('، '):'—'}</td>
+              <td>${sups.length?sups.map(escHtml).join('، '):'—'}</td>
+              <td><strong>${cons.length?cons.map(escHtml).join('<br>'):'—'}</strong></td>
+              <td>${escHtml(s.shipping_line)||'—'}</td>
               <td>${fmtDate(s.container_order_date)}</td>
               <td>${fmtDate(s.eta_date)}</td>
               <td>${fmtDate(s.ata_date)}</td>
-              <td>${s.total_quantity!=null?fmtNum(s.total_quantity):'—'}</td>
+              <td>${qty!=null&&qty!==''?fmtNum(qty):'—'}${nItems>1?` <span class="muted">(${nItems} أصناف)</span>`:''}</td>
               <td>${lastDone?lastDone[1]:'—'} <span class="muted">(${progress}/${SHIP_MILESTONES.length})</span></td>
-              <td>${s.status||'—'}</td>
-              <td>${s.tracking_url ? `<a href="${s.tracking_url}" target="_blank" class="btn small" style="color:var(--primary)">تتبع ↗</a>` : '—'}</td>
+              <td>${escHtml(s.status)||'—'}</td>
+              <td>${s.tracking_url ? `<a href="${escHtml(s.tracking_url)}" target="_blank" rel="noopener" class="btn small" style="color:var(--primary)">تتبع ↗</a>` : '—'}</td>
               <td>${userLabel(s.updated_by)}</td>
               <td>${(canAdd||canWarehouse())?`<button class="btn small" data-id="${s.id}" data-act="edit-ship">${canEditExisting()?'تعديل':'عرض'}</button>`:''}</td>
             </tr>`;
@@ -1961,9 +2082,9 @@ function renderShipments(root){
     </div>
   `;
   root.querySelector('#exp-ship').onclick = () => exportToExcel(cache.shipments.map(s=>{
-    const po = cache.orders.find(o=>o.id===s.po_id);
-    const row = { رقم_الأمر: po?.po_number, المورد: po?supplierName(po.supplier_id):'', رقم_الحاوية: s.container_number, شركة_الشحن: s.shipping_line,
-      تاريخ_طلب_الحاوية: s.container_order_date, محتويات_الحاوية: s.container_contents, الكمية_الإجمالية: s.total_quantity,
+    const itemsTxt = shipItems(s.id).map(i=>`${cache.orders.find(o=>o.id===i.po_id)?.po_number||'—'}: ${i.item_name||'—'} × ${i.quantity??'—'}`).join(' ؛ ');
+    const row = { أوامر_الشراء: shipPoNumbers(s).join('، '), الموردون: shipSupplierNames(s).join('، '), أرقام_الحاويات: shipContainerList(s).join(' / '), شركة_الشحن: s.shipping_line,
+      تاريخ_طلب_الحاوية: s.container_order_date, الأصناف: itemsTxt || s.container_contents, الكمية_الإجمالية: shipTotalQty(s),
       رابط_التتبع: s.tracking_url, الحالة: s.status, تم_التحديث_بواسطة: userLabel(s.updated_by), ملاحظات: s.notes };
     SHIP_MILESTONES.forEach(m=>row[m[1]]=s[m[0]]); return row;
   }), 'shipments');
@@ -1971,30 +2092,48 @@ function renderShipments(root){
   root.querySelectorAll('[data-act="edit-ship"]').forEach(b=>{
     b.onclick = () => openShipmentModal(cache.shipments.find(s=>s.id===b.dataset.id));
   });
+  wireBulk(root, 'shipments', list, { table:'erp_shipments', label:'شحنة', plural:'الشحنات', attachType:'shipment', note:'(بحاوياتها وأصنافها ومرفقاتها)' });
 }
 
 function openShipmentModal(ship){
   const isEdit = !!ship;
   const editable = !isEdit ? canWrite() : canEditExisting();
+  const owner = canDelete();
   const attachments = isEdit ? attachmentsFor('shipment', ship.id) : [];
+  const dis = editable ? '' : 'disabled';
+
+  // نسخة قابلة للتعديل من الحاويات والأصناف
+  let containers = isEdit ? shipContainers(ship.id).map(c=>({ id:c.id, number:c.container_number||'' })) : [];
+  let items = isEdit ? shipItems(ship.id).map(i=>({ id:i.id, po_id:i.po_id||'', name:i.item_name||'', qty:i.quantity==null?'':i.quantity })) : [];
+  // شحنة قديمة بدون صفوف فرعية: نعرض بياناتها القديمة، وتُحفظ كصفوف جديدة عند أول حفظ
+  if (isEdit && !containers.length) containers = splitContainers(ship.container_number).map(n=>({ id:null, number:n }));
+  if (isEdit && !items.length && ship.po_id) items = [{ id:null, po_id:ship.po_id, name:ship.container_contents||'', qty:ship.total_quantity==null?'':ship.total_quantity }];
+  if (!containers.length) containers.push({ id:null, number:'' });
+  if (!items.length) items.push({ id:null, po_id:'', name:'', qty:'' });
+
   openModal(`
     <h3>${isEdit?'تعديل شحنة':'شحنة جديدة'}</h3>
-    <div class="field"><label>أمر الشراء</label><select id="s-po_id">${orderOptions(ship?.po_id)}</select></div>
-    <div class="row">
-      <div class="field"><label>رقم الحاوية</label><input id="s-container_number" value="${ship?.container_number||''}" placeholder="XXXX1234567"></div>
-      <div class="field"><label>شركة الشحن</label><input id="s-shipping_line" value="${ship?.shipping_line||''}" placeholder="مثال: MSC, Maersk, CMA CGM"></div>
+    <div class="field">
+      <label>الحاويات (رقم لكل حاوية)</label>
+      <div id="s-containers"></div>
+      ${editable ? '<button type="button" class="btn small" id="sc-add">+ إضافة حاوية</button>' : ''}
+    </div>
+    <div class="field">
+      <label>الأصناف — كل صنف مرتبط بأمر شراء (الشحنة قد تضم أكثر من أمر)</label>
+      <div id="s-items"></div>
+      ${editable ? '<button type="button" class="btn small" id="si-add">+ إضافة صنف</button>' : ''}
+      <p class="muted" style="margin-top:6px">الكمية الإجمالية: <strong id="s-total-qty">0</strong> <span>(مجموع كميات الأصناف)</span></p>
     </div>
     <div class="row">
+      <div class="field"><label>شركة الشحن</label><input id="s-shipping_line" value="${escHtml(ship?.shipping_line)}" placeholder="مثال: MSC, Maersk, CMA CGM"></div>
       <div class="field"><label>تاريخ طلب الحاوية</label><input type="date" id="s-container_order_date" value="${ship?.container_order_date||''}"></div>
-      <div class="field"><label>الكمية الإجمالية</label><input type="number" step="0.01" id="s-total_quantity" value="${ship?.total_quantity||''}"></div>
     </div>
-    <div class="field"><label>محتويات الحاوية (التفاصيل)</label><textarea id="s-container_contents" placeholder="تفاصيل الأصناف داخل الحاوية">${ship?.container_contents||''}</textarea></div>
-    <div class="field"><label>رابط التتبع</label><input id="s-tracking_url" value="${ship?.tracking_url||''}" placeholder="https://..."></div>
+    <div class="field"><label>رابط التتبع</label><input id="s-tracking_url" value="${escHtml(ship?.tracking_url)}" placeholder="https://..."></div>
     <div class="row">
       ${SHIP_MILESTONES.map(([key,label])=>`<div class="field"><label>${label}</label><input type="date" id="s-${key}" value="${ship?.[key]||''}"></div>`).join('')}
     </div>
-    <div class="field"><label>الحالة</label><input id="s-status" value="${ship?.status||''}"></div>
-    <div class="field"><label>ملاحظات</label><textarea id="s-notes">${ship?.notes||''}</textarea></div>
+    <div class="field"><label>الحالة</label><input id="s-status" value="${escHtml(ship?.status)}"></div>
+    <div class="field"><label>ملاحظات</label><textarea id="s-notes">${escHtml(ship?.notes)}</textarea></div>
     ${isEdit && ship?.updated_by ? `<p class="muted">آخر تحديث بواسطة: ${userLabel(ship.updated_by)}</p>` : ''}
     ${isEdit ? renderAttachmentsBlock('shipment', ship.id, attachments) : '<p class="muted" style="margin-top:8px">📎 اضغط "حفظ" أولاً — ستفتح النافذة تلقائيًا لإرفاق الملفات.</p>'}
     <div class="row" style="margin-top:14px">
@@ -2003,36 +2142,129 @@ function openShipmentModal(ship){
       ${isEdit && canDelete() ? `<button class="btn danger" id="del-ship">حذف</button>` : ''}
     </div>
   `, (root)=>{
+    root.querySelector('.modal').style.maxWidth = '860px';
+    const lineNames = (poId) => [...new Set(linesFor(poId).map(l=>l.item_name).filter(Boolean))];
+    const poSelect = (po) => `<option value="">— اختر أمر الشراء —</option>${orderOptions(po)}`;
+    const updateTotal = () => {
+      const t = items.reduce((a,it)=>a+(parseFloat(it.qty)||0),0);
+      root.querySelector('#s-total-qty').textContent = fmtNum(t);
+    };
+    const renderRows = () => {
+      root.querySelector('#s-containers').innerHTML = containers.map((c,i)=>`
+        <div class="sh-row">
+          <input class="sc-num" data-i="${i}" value="${escHtml(c.number)}" placeholder="XXXX1234567" style="flex:1" ${dis}>
+          ${editable && containers.length>1 && (!c.id || owner) ? `<button type="button" class="btn small danger sc-del" data-i="${i}" title="حذف الحاوية">✕</button>` : ''}
+        </div>`).join('');
+      root.querySelector('#s-items').innerHTML = items.map((it,i)=>`
+        <div class="sh-row items">
+          <select class="si-po" data-i="${i}" style="flex:2 1 190px" ${dis}>${poSelect(it.po_id)}</select>
+          <input class="si-name" data-i="${i}" list="si-dl-${i}" value="${escHtml(it.name)}" placeholder="اسم الصنف" style="flex:2 1 170px" ${dis}>
+          <datalist id="si-dl-${i}">${lineNames(it.po_id).map(n=>`<option value="${escHtml(n)}"></option>`).join('')}</datalist>
+          <input class="si-qty" data-i="${i}" type="number" step="0.01" min="0" value="${escHtml(it.qty)}" placeholder="الكمية" style="flex:1 1 100px" ${dis}>
+          ${editable && items.length>1 && (!it.id || owner) ? `<button type="button" class="btn small danger si-del" data-i="${i}" title="حذف الصنف">✕</button>` : ''}
+        </div>`).join('');
+      updateTotal();
+    };
+    const sync = () => {
+      root.querySelectorAll('.sc-num').forEach(el=>{ containers[+el.dataset.i].number = el.value; });
+      root.querySelectorAll('.si-po').forEach(el=>{ items[+el.dataset.i].po_id = el.value; });
+      root.querySelectorAll('.si-name').forEach(el=>{ items[+el.dataset.i].name = el.value; });
+      root.querySelectorAll('.si-qty').forEach(el=>{ items[+el.dataset.i].qty = el.value; });
+    };
+    renderRows();
+    root.querySelector('#s-containers').addEventListener('click', (e)=>{
+      const b = e.target.closest('.sc-del'); if (!b) return;
+      sync(); containers.splice(+b.dataset.i, 1); renderRows();
+    });
+    root.querySelector('#s-items').addEventListener('click', (e)=>{
+      const b = e.target.closest('.si-del'); if (!b) return;
+      sync(); items.splice(+b.dataset.i, 1); renderRows();
+    });
+    root.querySelector('#s-items').addEventListener('input', ()=>{ sync(); updateTotal(); });
+    root.querySelector('#s-items').addEventListener('change', (e)=>{
+      if (!e.target.classList.contains('si-po')) return;
+      sync();
+      const dl = root.querySelector('#si-dl-'+e.target.dataset.i);
+      if (dl) dl.innerHTML = lineNames(e.target.value).map(n=>`<option value="${escHtml(n)}"></option>`).join('');
+    });
+    if (editable) {
+      root.querySelector('#sc-add').onclick = () => { sync(); containers.push({ id:null, number:'' }); renderRows(); };
+      root.querySelector('#si-add').onclick = () => { sync(); items.push({ id:null, po_id:items[items.length-1]?.po_id||'', name:'', qty:'' }); renderRows(); };
+    }
     root.querySelector('#cancel-ship').onclick = closeModal;
+
     if (editable) root.querySelector('#save-ship').onclick = async () => {
+      sync();
+      const cleanC = containers.map(c=>({ id:c.id, number:(c.number||'').trim() })).filter(c=>c.number);
+      const seen = new Set();
+      for (const c of cleanC) { const k = c.number.toUpperCase(); if (seen.has(k)) { toast('رقم الحاوية مكرر داخل الشحنة: '+c.number); return; } seen.add(k); }
+      const cleanI = items.filter(it => it.po_id || (it.name||'').trim() || String(it.qty).trim()!=='');
+      if (!cleanI.length || cleanI.some(it=>!it.po_id)) { toast('كل صنف لازم يكون له أمر شراء — اختر الأمر لكل صف أو احذف الصف الفارغ'); return; }
+      if (cleanI.some(it=>String(it.qty).trim()!=='' && !(parseFloat(it.qty)>=0))) { toast('كمية غير صحيحة في أحد الأصناف'); return; }
+      // صفوف محفوظة سابقًا واختفت = حذف → للمالك فقط
+      const oldC = isEdit ? shipContainers(ship.id) : [], oldI = isEdit ? shipItems(ship.id) : [];
+      const keepC = new Set(cleanC.filter(c=>c.id).map(c=>c.id)), keepI = new Set(cleanI.filter(i=>i.id).map(i=>i.id));
+      const delC = oldC.filter(c=>!keepC.has(c.id)).map(c=>c.id), delI = oldI.filter(i=>!keepI.has(i.id)).map(i=>i.id);
+      if ((delC.length || delI.length) && !owner) { toast('حذف حاوية أو صنف محفوظ مسموح للمالك فقط'); return; }
+
+      const totalQty = cleanI.reduce((a,it)=>a+(parseFloat(it.qty)||0),0);
       const payload = {
-        po_id: val('s-po_id'), container_number: val('s-container_number')||null,
+        po_id: cleanI[0].po_id,
+        container_number: cleanC.map(c=>c.number).join(' / ') || null,
         shipping_line: val('s-shipping_line')||null, tracking_url: val('s-tracking_url')||null,
         container_order_date: val('s-container_order_date')||null,
-        container_contents: val('s-container_contents')||null,
-        total_quantity: parseFloat(val('s-total_quantity'))||null,
+        container_contents: cleanI.map(i=>(i.name||'').trim()).filter(Boolean).join('، ') || null,
+        total_quantity: totalQty || null,
         notes: val('s-notes')||null,
         status: val('s-status')||null,
         updated_by: currentUser.id,
       };
       SHIP_MILESTONES.forEach(([key])=> payload[key] = val('s-'+key) || null);
+
+      let shipId = isEdit ? ship.id : null;
       try {
         if (isEdit) {
-          const { error } = await sb.from('erp_shipments').update(payload).eq('id', ship.id);
+          const { error } = await sb.from('erp_shipments').update(payload).eq('id', shipId);
           if (error) throw error;
-          toast('تم الحفظ'); closeModal(); await refreshAll(); renderActiveTab();
         } else {
           payload.created_by = currentUser.id;
           const { data: newShip, error } = await sb.from('erp_shipments').insert(payload).select().single();
           if (error) throw error;
-          await refreshAll(); renderActiveTab();
-          toast('تم الحفظ — يمكنك الآن إرفاق ملف');
-          openShipmentModal(cache.shipments.find(s=>s.id===newShip.id));
+          shipId = newShip.id;
         }
-      } catch(e){ toast('خطأ: '+e.message); }
+        // الحاويات
+        if (delC.length) { const { error } = await sb.from('erp_shipment_containers').delete().in('id', delC); if (error) throw error; }
+        for (const c of cleanC.filter(c=>c.id)) {
+          const old = oldC.find(x=>x.id===c.id);
+          if (old && old.container_number !== c.number) { const { error } = await sb.from('erp_shipment_containers').update({ container_number:c.number }).eq('id', c.id); if (error) throw error; }
+        }
+        const newC = cleanC.filter(c=>!c.id).map(c=>({ shipment_id:shipId, container_number:c.number, created_by:currentUser.id }));
+        if (newC.length) { const { error } = await sb.from('erp_shipment_containers').insert(newC); if (error) throw error; }
+        // الأصناف
+        if (delI.length) { const { error } = await sb.from('erp_shipment_items').delete().in('id', delI); if (error) throw error; }
+        const toRow = (it) => {
+          const name = (it.name||'').trim();
+          const ln = cache.lines.find(l=>l.po_id===it.po_id && l.item_name && l.item_name.trim()===name);
+          return { po_id:it.po_id, po_line_item_id: ln ? ln.id : null, item_name: name || null, quantity: String(it.qty).trim()==='' ? null : parseFloat(it.qty) };
+        };
+        for (const it of cleanI.filter(i=>i.id)) {
+          const old = oldI.find(x=>x.id===it.id), r = toRow(it);
+          if (old && (old.po_id!==r.po_id || (old.item_name||null)!==r.item_name || Number(old.quantity)!==Number(r.quantity) || (old.quantity==null)!==(r.quantity==null) || (old.po_line_item_id||null)!==r.po_line_item_id)) {
+            const { error } = await sb.from('erp_shipment_items').update(r).eq('id', it.id); if (error) throw error;
+          }
+        }
+        const newI = cleanI.filter(i=>!i.id).map(it=>({ ...toRow(it), shipment_id:shipId, created_by:currentUser.id }));
+        if (newI.length) { const { error } = await sb.from('erp_shipment_items').insert(newI); if (error) throw error; }
+        toast(isEdit ? 'تم الحفظ' : 'تم الحفظ — يمكنك الآن إرفاق ملف');
+        await refreshAll(); renderActiveTab();
+        if (isEdit) closeModal(); else openShipmentModal(cache.shipments.find(s=>s.id===shipId));
+      } catch(e){
+        toast('خطأ: '+e.message);
+        if (shipId) { await refreshAll(); renderActiveTab(); openShipmentModal(cache.shipments.find(s=>s.id===shipId)); }
+      }
     };
     if (isEdit && canDelete()) root.querySelector('#del-ship').onclick = async () => {
-      if (!confirm('حذف هذه الشحنة؟')) return;
+      if (!confirm('حذف هذه الشحنة بحاوياتها وأصنافها؟')) return;
       const { error } = await sb.from('erp_shipments').delete().eq('id', ship.id);
       if (error) { toast('خطأ: '+error.message); return; }
       toast('تم الحذف'); closeModal(); await refreshAll(); renderActiveTab();
@@ -2062,13 +2294,14 @@ function renderSeason(root){
           ${canAdd ? '<button class="btn primary small" id="add-season">+ بند جديد</button>' : ''}
         </div>
       </div>
+      ${bulkBarHtml('season', cache.season)}
       <div style="overflow:auto;max-height:60vh">
       <table>
-        <thead><tr><th>الصنف</th><th>المورد</th><th>موعد الحاجة</th><th>موعد الالتزام (محسوب)</th><th>مرتبط بأمر؟</th><th>الحالة</th><th></th></tr></thead>
+        <thead><tr>${bulkThHtml('season', cache.season)}<th>الصنف</th><th>المورد</th><th>موعد الحاجة</th><th>موعد الالتزام (محسوب)</th><th>مرتبط بأمر؟</th><th>الحالة</th><th></th></tr></thead>
         <tbody>
           ${cache.season.map(s=>`
             <tr>
-              <td>${s.item_name}</td><td>${supplierName(s.supplier_id)}</td>
+              ${bulkTdHtml('season', s.id)}<td>${s.item_name}</td><td>${supplierName(s.supplier_id)}</td>
               <td>${fmtDate(s.need_by_date)}</td><td><strong>${fmtDate(s.commitment_date)}</strong></td>
               <td>${s.linked_po_id? '✓' : '—'}</td><td>${s.status}</td>
               <td>${canAdd?`<button class="btn small" data-id="${s.id}" data-act="edit-season">${canEditExisting()?'تعديل':'عرض'}</button>`:''}</td>
@@ -2087,6 +2320,7 @@ function renderSeason(root){
   root.querySelectorAll('[data-act="edit-season"]').forEach(b=>{
     b.onclick = () => openSeasonModal(cache.season.find(s=>s.id===b.dataset.id));
   });
+  wireBulk(root, 'season', cache.season, { table:'erp_season_plan', label:'بند', plural:'بنود خطة الموسم', attachType:'season' });
 }
 function openSeasonModal(item){
   const isEdit = !!item;
@@ -2175,13 +2409,14 @@ function renderSuppliers(root){
           ${canAdd ? '<button class="btn primary small" id="add-sup">+ مورد جديد</button>' : ''}
         </div>
       </div>
+      ${bulkBarHtml('suppliers', cache.suppliers)}
       <div style="overflow:auto;max-height:60vh">
       <table>
-        <thead><tr><th>الاسم</th><th>الفئة</th><th>الدولة</th><th>شروط الدفع</th><th>مهلة التوريد (يوم)</th><th>نشط؟</th><th></th></tr></thead>
+        <thead><tr>${bulkThHtml('suppliers', cache.suppliers)}<th>الاسم</th><th>الفئة</th><th>الدولة</th><th>شروط الدفع</th><th>مهلة التوريد (يوم)</th><th>نشط؟</th><th></th></tr></thead>
         <tbody>
           ${cache.suppliers.map(s=>`
             <tr>
-              <td>${s.name}</td><td>${s.category||'—'}</td><td>${s.country||'—'}</td>
+              ${bulkTdHtml('suppliers', s.id)}<td>${s.name}</td><td>${s.category||'—'}</td><td>${s.country||'—'}</td>
               <td>${s.payment_terms||'—'}</td><td>${s.lead_time_days??'—'}</td>
               <td>${s.is_active?'✓':'—'}</td>
               <td>${canAdd?`<button class="btn small" data-id="${s.id}" data-act="edit-sup">${canEditExisting()?'تعديل':'عرض'}</button>`:''}</td>
@@ -2198,6 +2433,7 @@ function renderSuppliers(root){
   root.querySelectorAll('[data-act="edit-sup"]').forEach(b=>{
     b.onclick = () => openSupplierModal(cache.suppliers.find(s=>s.id===b.dataset.id));
   });
+  wireBulk(root, 'suppliers', cache.suppliers, { table:'erp_suppliers', label:'مورد', plural:'الموردين', attachType:'supplier', note:'(المورد المرتبط بأوامر أو دفعات لن يُحذف)' });
 }
 function openSupplierModal(sup){
   const isEdit = !!sup;
@@ -2274,13 +2510,14 @@ function renderSamples(root){
           ${canAdd ? '<button class="btn primary small" id="add-sample">+ عينة جديدة</button>' : ''}
         </div>
       </div>
+      ${bulkBarHtml('samples', cache.samples)}
       <div style="overflow:auto;max-height:60vh">
       <table>
-        <thead><tr><th>الصنف</th><th>المورد</th><th>الفئة</th><th>الكمية</th><th>تاريخ الاستلام</th><th>الحالة</th><th></th></tr></thead>
+        <thead><tr>${bulkThHtml('samples', cache.samples)}<th>الصنف</th><th>المورد</th><th>الفئة</th><th>الكمية</th><th>تاريخ الاستلام</th><th>الحالة</th><th></th></tr></thead>
         <tbody>
           ${cache.samples.map(s=>`
             <tr>
-              <td>${s.item_name}</td><td>${supplierName(s.supplier_id)}</td><td>${s.category||'—'}</td>
+              ${bulkTdHtml('samples', s.id)}<td>${s.item_name}</td><td>${supplierName(s.supplier_id)}</td><td>${s.category||'—'}</td>
               <td>${s.quantity!=null?fmtNum(s.quantity)+' '+(s.unit||''):'—'}</td>
               <td>${fmtDate(s.received_date)}</td>
               <td>${sampleStatusBadge(s.status)}</td>
@@ -2299,6 +2536,7 @@ function renderSamples(root){
   root.querySelectorAll('[data-act="edit-sample"]').forEach(b=>{
     b.onclick = () => openSampleModal(cache.samples.find(s=>s.id===b.dataset.id));
   });
+  wireBulk(root, 'samples', cache.samples, { table:'erp_samples', label:'عينة', plural:'العينات', attachType:'sample' });
 }
 
 function openSampleModal(sample){
@@ -2380,18 +2618,19 @@ function renderWarehouseReceipts(root){
           ${canAdd ? '<button class="btn primary small" id="add-wh">+ استلام جديد</button>' : ''}
         </div>
       </div>
+      ${bulkBarHtml('receipts', cache.warehouseReceipts)}
       <div style="overflow:auto;max-height:60vh">
       <table>
-        <thead><tr><th>الأمر</th><th>المورد</th><th>الحاوية</th><th>موقع المستودع</th><th>تاريخ الاستلام</th><th>استلم بواسطة</th><th>الحالة</th><th>حالة البضاعة</th><th></th></tr></thead>
+        <thead><tr>${bulkThHtml('receipts', cache.warehouseReceipts)}<th>الأمر</th><th>المورد</th><th>الحاوية</th><th>موقع المستودع</th><th>تاريخ الاستلام</th><th>استلم بواسطة</th><th>الحالة</th><th>حالة البضاعة</th><th></th></tr></thead>
         <tbody>
           ${cache.warehouseReceipts.map(r=>{
             const po = cache.orders.find(o=>o.id===r.po_id);
             const ship = cache.shipments.find(s=>s.id===r.shipment_id);
             const condBad = r.condition_status && r.condition_status !== 'سليمة بالكامل';
             return `<tr>
-              <td>${po?po.po_number||'—':'—'}</td>
+              ${bulkTdHtml('receipts', r.id)}<td>${po?po.po_number||'—':'—'}</td>
               <td>${po?supplierName(po.supplier_id):'—'}</td>
-              <td>${ship?.container_number||'—'}</td>
+              <td>${ship?shipLabel(ship):'—'}</td>
               <td>${r.warehouse_location||'—'}</td>
               <td>${fmtDate(r.received_date)}</td>
               <td>${r.received_by_name||'—'}</td>
@@ -2414,6 +2653,7 @@ function renderWarehouseReceipts(root){
   root.querySelectorAll('[data-act="edit-wh"]').forEach(b=>{
     b.onclick = () => openWarehouseReceiptModal(cache.warehouseReceipts.find(r=>r.id===b.dataset.id));
   });
+  wireBulk(root, 'receipts', cache.warehouseReceipts, { table:'erp_warehouse_receipts', label:'استلام', plural:'استلامات المستودع', attachType:'receipt', note:'(بكل بنودها)' });
 }
 
 function renderReceiptLinesBlock(receipt){
@@ -2506,7 +2746,7 @@ function openWarehouseReceiptModal(receipt){
     <h3>${isEdit?'تعديل استلام مستودع':'استلام مستودع جديد'}</h3>
     <div class="row">
       <div class="field"><label>أمر الشراء</label><select id="wh-po_id"><option value="">—</option>${orderOptions(receipt?.po_id)}</select></div>
-      <div class="field"><label>الشحنة (اختياري)</label><select id="wh-shipment_id"><option value="">—</option>${cache.shipments.map(s=>`<option value="${s.id}" ${receipt?.shipment_id===s.id?'selected':''}>${s.container_number||'بدون رقم حاوية'}</option>`).join('')}</select></div>
+      <div class="field"><label>الشحنة (اختياري)</label><select id="wh-shipment_id"><option value="">—</option>${cache.shipments.map(s=>`<option value="${s.id}" ${receipt?.shipment_id===s.id?'selected':''}>${escHtml(shipLabel(s))}</option>`).join('')}</select></div>
     </div>
     <div class="row">
       <div class="field"><label>موقع المستودع</label><input id="wh-warehouse_location" list="wh-locations" value="${receipt?.warehouse_location||''}" placeholder="مثال: المستودع الرئيسي، مستودع خمرة">
@@ -2654,7 +2894,7 @@ function renderComparison(root){
 // ============================================================
 const TABLE_LABELS = {
   erp_suppliers:'الموردون', erp_purchase_orders:'أوامر الشراء', erp_po_line_items:'بنود الأوامر',
-  erp_payments:'الدفعات', erp_shipments:'الشحنات', erp_season_plan:'خطة الموسم',
+  erp_payments:'الدفعات', erp_shipments:'الشحنات', erp_shipment_items:'أصناف الشحنات', erp_shipment_containers:'حاويات الشحنات', erp_season_plan:'خطة الموسم',
   erp_attachments:'المرفقات', erp_samples:'العينات',
   erp_warehouse_receipts:'استلام المستودع', erp_warehouse_receipt_lines:'بنود استلام المستودع',
   erp_profiles:'الحسابات', erp_accounts:'حذف حساب', erp_payment_comments:'تعليقات الدفعات',
