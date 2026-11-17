@@ -197,7 +197,7 @@ function emailFor(input){
 let currentUser = null;
 let currentProfile = null;
 let activeTab = 'dashboard';
-let cache = { suppliers:[], orders:[], lines:[], payments:[], shipments:[], shipmentItems:[], shipmentContainers:[], season:[], profiles:[], audit:[], attachments:[], samples:[], warehouseReceipts:[], warehouseReceiptLines:[], paymentComments:[], financePayments:[] };
+let cache = { suppliers:[], orders:[], lines:[], payments:[], shipments:[], shipmentItems:[], shipmentContainers:[], season:[], profiles:[], audit:[], attachments:[], samples:[], warehouseReceipts:[], warehouseReceiptLines:[], paymentComments:[], financePayments:[], backupLog:[] };
 let chartInstances = {};
 let selectedOrderIds = new Set();
 let dashFilter = { from:'', to:'', supplier:'', category:'' };
@@ -303,7 +303,7 @@ async function refreshAll(){
   }
   const isOwner = role === 'owner';
   const empty = Promise.resolve({ data: [] });
-  const [s,o,l,p,sh,sp,pr,au,at,sm,wr,wl,pc,si,sc] = await Promise.all([
+  const [s,o,l,p,sh,sp,pr,au,at,sm,wr,wl,pc,si,sc,bl] = await Promise.all([
     sb.from('erp_suppliers').select('*').order('name'),
     sb.from('erp_purchase_orders').select('*').order('created_at',{ascending:false}),
     sb.from('erp_po_line_items').select('*').order('created_at'),
@@ -319,6 +319,7 @@ async function refreshAll(){
     role === 'warehouse' ? empty : sb.from('erp_payment_comments').select('*').order('created_at'),
     sb.from('erp_shipment_items').select('*').order('created_at'),
     sb.from('erp_shipment_containers').select('*').order('created_at'),
+    isOwner ? sb.from('erp_backup_log').select('*').order('created_at',{ascending:false}).limit(30) : empty,
   ]);
   cache.suppliers = s.data||[];
   cache.orders = o.data||[];
@@ -327,6 +328,7 @@ async function refreshAll(){
   cache.shipments = sh.data||[];
   cache.shipmentItems = si.data||[];
   cache.shipmentContainers = sc.data||[];
+  cache.backupLog = bl.data||[];
   cache.season = sp.data||[];
   cache.profiles = pr.data||[];
   cache.audit = au.data||[];
@@ -493,6 +495,7 @@ const TAB_DEFS = [
   {id:'comparison', label:'مقارنة الموردين', icon:'⚖️', roles:['owner','editor','viewer']},
   {id:'audit', label:'سجل التعديلات', icon:'📝', roles:['owner']},
   {id:'users', label:'المستخدمون', icon:'👥', roles:['owner']},
+  {id:'backup', label:'النسخ الاحتياطي', icon:'💾', roles:['owner']},
 ];
 const ROLE_LABELS = {owner:'المالك', editor:'محرر', data_entry:'مُدخل بيانات', finance:'المالية', viewer:'مشاهد', warehouse:'المستودع', pending:'قيد المراجعة'};
 function escHtml(v){ return String(v==null?'':v).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
@@ -535,8 +538,14 @@ function renderActiveTab(){
     comparison: renderComparison,
     audit: renderAudit,
     users: renderUsers,
+    backup: renderBackup,
   };
   (renderers[activeTab] || (()=>{}))(root);
+  if (currentProfile.role==='owner' && activeTab==='dashboard' && typeof backupIsStale==='function' && backupIsStale()) {
+    const b = document.createElement('div'); b.className='card'; b.style.cssText='border:1px solid var(--warn);background:var(--warn-light);margin-bottom:12px';
+    b.innerHTML = `<strong>💾 لا توجد نسخة احتياطية حديثة (أكثر من ${BACKUP_STALE_DAYS} أيام أو لم تؤخذ بعد).</strong> <button class="btn small" id="go-backup" style="margin-inline-start:8px">خذ نسخة الآن</button>`;
+    root.prepend(b); b.querySelector('#go-backup').onclick = ()=>{ activeTab='backup'; renderTabs(); renderActiveTab(); };
+  }
 }
 
 // ============================================================
@@ -1307,6 +1316,7 @@ function renderOrders(root){
         <strong>أوامر الشراء (${cache.orders.length})</strong>
         <div class="row" style="flex:0;gap:8px">
           <button class="btn small" id="exp-orders">تصدير إكسل</button>
+          <button class="btn small" id="exp-lines">تصدير البنود</button>
           ${canAdd ? '<button class="btn small" id="imp-orders">⬆️ استيراد إكسل</button>' : ''}
           ${canAdd ? '<button class="btn primary small" id="add-order">+ أمر جديد</button>' : ''}
         </div>
@@ -1361,6 +1371,7 @@ function renderOrders(root){
       الحالة:o.status, نما_سوفت:o.nama_uploaded?'نعم':'لا', تاريخ_الأمر:o.order_date, موعد_الحاجة:o.need_by_date, ملاحظات:o.notes
     };
   }), 'purchase_orders');
+  root.querySelector('#exp-lines').onclick = () => exportToExcel(cache.lines.map(l=>{ const o = cache.orders.find(x=>x.id===l.po_id)||{}; const {id, po_id, created_at, ...rest} = l; return { رقم_الأمر:o.po_number, المورد:supplierName(o.supplier_id), ...rest }; }), 'po_line_items');
   if (canAdd) root.querySelector('#add-order').onclick = () => openOrderModal(null);
   root.querySelectorAll('[data-act="edit-order"]').forEach(b=>{
     b.onclick = () => openOrderModal(cache.orders.find(o=>o.id===b.dataset.id));
@@ -1844,6 +1855,7 @@ function renderFinancePayments(root){
         <strong>الدفعات — المالية (${rows.length} من ${all.length}) · غير مدفوعة: ${nUnpaid}</strong>
         <div class="row" style="flex:0;gap:8px">
           <select id="fin-st" style="width:auto"><option value="unpaid" ${finFilter.st==='unpaid'?'selected':''}>غير المدفوعة</option><option value="paid" ${finFilter.st==='paid'?'selected':''}>المدفوعة</option><option value="all" ${finFilter.st==='all'?'selected':''}>الكل</option></select>
+          <button class="btn small" id="exp-fin">تصدير إكسل</button>
           <input id="fin-q" value="${escHtml(finFilter.q)}" placeholder="بحث: أمر / مورد / صنف" style="width:200px">
         </div>
       </div>
@@ -1868,6 +1880,7 @@ function renderFinancePayments(root){
       </table>
       </div>
     </div>`;
+  root.querySelector('#exp-fin').onclick = () => exportToExcel(rows.map(p=>({ الأمر:p.po_number, المورد:p.supplier_name, الصنف:p.item_name, المبلغ:p.amount, العملة:p.currency, الاستحقاق:p.due_date, الحالة:p.status, تاريخ_التحويل:p.transferred_date, المرجع:p.reference })), 'finance_payments');
   root.querySelector('#fin-st').onchange = e => { finFilter.st = e.target.value; renderFinancePayments(root); };
   root.querySelector('#fin-q').oninput = e => { finFilter.q = e.target.value; const pos = e.target.selectionStart; renderFinancePayments(root); const i = root.querySelector('#fin-q'); i.focus(); i.setSelectionRange(pos,pos); };
   root.querySelectorAll('.fin-paid').forEach(cb=>{
@@ -3000,7 +3013,7 @@ function renderUsers(root){
   const ASSIGNABLE = ['pending','data_entry','editor','finance','viewer','warehouse'];
   root.innerHTML = `
     <div class="card">
-      <strong>المستخدمون (${cache.profiles.length})</strong>
+      <div class="toolbar"><strong>المستخدمون (${cache.profiles.length})</strong><button class="btn small" id="exp-users">تصدير إكسل</button></div>
       <p class="muted" style="margin-top:6px">المالك وحده يمنح الأدوار ويحذف الحسابات ويرى سجل التعديلات. الحذف من النظام (أوامر/دفعات/…) للمالك فقط. دور "المالك" لا يُمنح ولا يُسحب من الواجهة.</p>
       <div style="overflow:auto;max-height:65vh;margin-top:10px">
       <table>
@@ -3020,6 +3033,7 @@ function renderUsers(root){
       </div>
     </div>
   `;
+  root.querySelector('#exp-users').onclick = () => exportToExcel(cache.profiles.map(p=>({ الاسم:p.full_name, اسم_المستخدم:p.username, الدور:ROLE_LABELS[p.role]||p.role, تاريخ_الإنشاء:p.created_at })), 'users');
   root.querySelectorAll('.role-select').forEach(sel=>{
     sel.onchange = async () => {
       const { error } = await sb.from('erp_profiles').update({role: sel.value}).eq('id', sel.dataset.id);
@@ -3035,6 +3049,215 @@ function renderUsers(root){
       toast('تم حذف الحساب'); await refreshAll(); renderActiveTab();
     };
   });
+}
+
+// ============================================================
+// BACKUP (owner only) — نسخة احتياطية كاملة: xlsx + JSON (+ مجلد على الجهاز + المرفقات + نسخة طوارئ من الصفحة)
+// ============================================================
+const BACKUP_TABLES = [
+  ['erp_suppliers','الموردون'], ['erp_purchase_orders','أوامر الشراء'], ['erp_po_line_items','بنود الأوامر'],
+  ['erp_payments','الدفعات'], ['erp_payment_comments','تعليقات الدفعات'],
+  ['erp_shipments','الشحنات'], ['erp_shipment_items','أصناف الشحنات'], ['erp_shipment_containers','حاويات الشحنات'],
+  ['erp_season_plan','خطة الموسم'], ['erp_samples','العينات'],
+  ['erp_warehouse_receipts','استلام المستودع'], ['erp_warehouse_receipt_lines','بنود الاستلام'],
+  ['erp_attachments','المرفقات'], ['erp_profiles','الحسابات'],
+  ['erp_audit_log','سجل التعديلات'], ['erp_audit_archive','أرشيف السجل'],
+];
+const BACKUP_STALE_DAYS = 7;
+let backupBusy = false;
+
+// --- حفظ مقبض المجلد في IndexedDB (المتصفح يتذكره بين الجلسات) ---
+function idbOpen(){
+  return new Promise((res, rej)=>{
+    const r = indexedDB.open('erp-backup-db', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('kv');
+    r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+  });
+}
+async function idbGet(k){ const db = await idbOpen(); return new Promise((res, rej)=>{ const q = db.transaction('kv').objectStore('kv').get(k); q.onsuccess=()=>res(q.result); q.onerror=()=>rej(q.error); }); }
+async function idbSet(k, v){ const db = await idbOpen(); return new Promise((res, rej)=>{ const tx = db.transaction('kv','readwrite'); tx.objectStore('kv').put(v,k); tx.oncomplete=()=>res(); tx.onerror=()=>rej(tx.error); }); }
+async function idbDel(k){ const db = await idbOpen(); return new Promise((res, rej)=>{ const tx = db.transaction('kv','readwrite'); tx.objectStore('kv').delete(k); tx.oncomplete=()=>res(); tx.onerror=()=>rej(tx.error); }); }
+const canPickFolder = () => typeof window.showDirectoryPicker === 'function';
+
+async function fetchAllRows(table){
+  const out = []; const PAGE = 1000;
+  for (let from = 0; ; from += PAGE) {
+    const { data, error } = await sb.from(table).select('*').order('id').range(from, from + PAGE - 1);
+    if (error) throw error;
+    out.push(...(data||[]));
+    if (!data || data.length < PAGE) break;
+  }
+  return out;
+}
+function backupStamp(d=new Date()){
+  const p = n => String(n).padStart(2,'0');
+  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}`;
+}
+function cellSafe(v){
+  if (v == null) return '';
+  if (typeof v === 'object') v = JSON.stringify(v);
+  if (typeof v === 'string' && v.length > 32000) return v.slice(0, 32000) + '…[مقتطع — النص الكامل في ملف JSON]';
+  return v;
+}
+function buildBackupFiles(data, stamp, meta){
+  const wb = XLSX.utils.book_new();
+  const idx = BACKUP_TABLES.map(([t,label])=>({ الجدول:t, الوصف:label, عدد_السجلات:(data[t]||[]).length }));
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(idx), 'فهرس');
+  BACKUP_TABLES.forEach(([t])=>{
+    const rows = (data[t]||[]).map(r=>Object.fromEntries(Object.entries(r).map(([k,v])=>[k, cellSafe(v)])));
+    const ws = rows.length ? XLSX.utils.json_to_sheet(rows) : XLSX.utils.aoa_to_sheet([['(لا توجد سجلات)']]);
+    XLSX.utils.book_append_sheet(wb, ws, t.replace(/^erp_/,'').slice(0,31));
+  });
+  const xlsxBytes = XLSX.write(wb, { bookType:'xlsx', type:'array' });
+  const jsonText = JSON.stringify({ meta, tables: data }, null, 1);
+  return {
+    xlsx: { name:`procurement-backup_${stamp}.xlsx`, blob:new Blob([xlsxBytes], {type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'}) },
+    json: { name:`procurement-backup_${stamp}.json`, blob:new Blob([jsonText], {type:'application/json'}) },
+  };
+}
+function downloadBlob(name, blob){
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name;
+  document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(a.href), 20000);
+}
+async function writeToDir(dirHandle, name, blob){
+  const fh = await dirHandle.getFileHandle(name, { create:true });
+  const w = await fh.createWritable(); await w.write(blob); await w.close();
+}
+async function dirHas(dirHandle, name){ try { await dirHandle.getFileHandle(name); return true; } catch(e){ return false; } }
+async function ensureFolderPermission(h){
+  const opts = { mode:'readwrite' };
+  if ((await h.queryPermission(opts)) === 'granted') return true;
+  return (await h.requestPermission(opts)) === 'granted';
+}
+const BACKUP_README = `نسخة احتياطية — منظومة المشتريات (العز للعود)
+==============================================
+procurement-backup_<التاريخ>.xlsx : كل الجداول، كل جدول في ورقة، وورقة "فهرس" بعدد السجلات.
+procurement-backup_<التاريخ>.json : نفس البيانات كاملة (هذا الملف هو المرجع عند الاستعادة؛ إكسل يقتطع الخلايا الأطول من 32 ألف حرف).
+attachments\\ : ملفات المرفقات (فواتير/بوالص…) باسم <رقم المرفق>_<الاسم الأصلي>.
+app-copy\\index.html : نسخة طوارئ من الصفحة نفسها. تُفتح بالنقر المزدوج وتتصل بنفس قاعدة البيانات (تحتاج إنترنت).
+الاستعادة: افتح ملف JSON وأعد إدخال الجداول بالترتيب (الموردون ← الأوامر ← البنود ← الدفعات ← الشحنات…) أو اطلب من مطوّر المنظومة تشغيل سكربت الاستعادة.
+`;
+
+async function runBackup(mode, opts, ui){
+  if (backupBusy) return; backupBusy = true;
+  const say = (m)=>{ if (ui) ui.textContent = m; };
+  try {
+    let dir = null;
+    if (mode === 'folder') {
+      dir = await idbGet('dir');
+      if (!dir) { toast('اختر المجلد أولًا'); return; }
+      if (!(await ensureFolderPermission(dir))) { toast('لم يُمنح إذن الكتابة في المجلد'); return; }
+    }
+    const data = {}, failed = [], counts = {};
+    for (const [t, label] of BACKUP_TABLES) {
+      say(`جارٍ قراءة: ${label}…`);
+      try { data[t] = await fetchAllRows(t); } catch(e){ data[t] = []; failed.push(`${t}: ${e.message||e}`); }
+      counts[t] = data[t].length;
+    }
+    const total = Object.values(counts).reduce((a,b)=>a+b,0);
+    const stamp = backupStamp();
+    const meta = { created_at:new Date().toISOString(), created_by:currentUser && currentUser.email, source:location.origin+location.pathname, counts, failed_tables:failed, note:'نسخة كاملة من جداول erp_* ' };
+    say('جارٍ تجهيز الملفات…');
+    const files = buildBackupFiles(data, stamp, meta);
+    const names = [files.xlsx.name, files.json.name];
+    if (mode === 'folder') {
+      say('جارٍ الكتابة في المجلد…');
+      await writeToDir(dir, files.xlsx.name, files.xlsx.blob);
+      await writeToDir(dir, files.json.name, files.json.blob);
+      if (!(await dirHas(dir, 'اقرأني.txt'))) await writeToDir(dir, 'اقرأني.txt', new Blob([BACKUP_README], {type:'text/plain;charset=utf-8'}));
+      // نسخة طوارئ من الصفحة
+      try {
+        const html = await (await fetch(location.origin + location.pathname, { cache:'no-store' })).blob();
+        const app = await dir.getDirectoryHandle('app-copy', { create:true });
+        await writeToDir(app, 'index.html', html); names.push('app-copy/index.html');
+      } catch(e){ failed.push('app-copy: '+(e.message||e)); }
+      // المرفقات (تُنسخ الجديدة فقط)
+      if (opts && opts.attachments) {
+        const attDir = await dir.getDirectoryHandle('attachments', { create:true });
+        const atts = data.erp_attachments || []; let done = 0, copied = 0;
+        for (const a of atts) {
+          done++; say(`المرفقات ${done}/${atts.length}…`);
+          const fname = `${a.id}_${(a.file_name||'file').replace(/[\\/:*?"<>|]/g,'_')}`;
+          if (await dirHas(attDir, fname)) continue;
+          try {
+            const { data: blob, error } = await sb.storage.from('erp-attachments').download(a.file_path);
+            if (error) throw error;
+            await writeToDir(attDir, fname, blob); copied++;
+          } catch(e){ failed.push(`مرفق ${a.file_name||a.id}: ${e.message||e}`); }
+        }
+        names.push(`attachments/ (${copied} جديد)`);
+      }
+    } else {
+      downloadBlob(files.xlsx.name, files.xlsx.blob);
+      setTimeout(()=>downloadBlob(files.json.name, files.json.blob), 600);
+    }
+    await sb.from('erp_backup_log').insert({ kind:'manual', destination: mode==='folder'?'folder':'download', total_rows:total, row_counts:counts, failed_tables:failed, file_names:names });
+    await refreshAll();
+    toast(failed.length ? `تمت النسخة مع ${failed.length} تنبيه — راجع الجدول` : `تمت النسخة الاحتياطية (${total} سجل)`);
+    if (failed.length) alert('تنبيهات النسخة:\n' + failed.join('\n'));
+  } catch(e) {
+    console.error(e); toast('تعذّرت النسخة: ' + (e.message||e));
+  } finally { backupBusy = false; renderActiveTab(); }
+}
+
+function lastBackup(){ return (cache.backupLog||[])[0] || null; }
+function backupIsStale(){
+  const b = lastBackup(); if (!b) return true;
+  return (Date.now() - new Date(b.created_at).getTime()) > BACKUP_STALE_DAYS*86400000;
+}
+
+function renderBackup(root){
+  const last = lastBackup();
+  const logs = (cache.backupLog||[]).slice(0,15);
+  root.innerHTML = `
+    <div class="card">
+      <strong>النسخ الاحتياطي (للمالك فقط)</strong>
+      <p class="muted" style="margin-top:6px">آخر نسخة: ${last ? new Date(last.created_at).toLocaleString('ar-SA')+' — '+last.total_rows+' سجل — '+(last.destination==='folder'?'في المجلد':'تنزيل') : 'لا توجد نسخة مسجّلة بعد'}.
+      ${backupIsStale() ? '<span class="badge warn">تجاوزت '+BACKUP_STALE_DAYS+' أيام — خذ نسخة الآن</span>' : '<span class="badge ok">حديثة</span>'}</p>
+      <p class="muted">قاعدة 3-2-1: نسخة في قاعدة البيانات (Supabase تحفظ نسخًا يومية) + نسخة على جهازك/OneDrive + نسخة ثالثة خارجية (فلاشة أو حساب آخر). الحفظ في مجلد OneDrive يعني أنه يتزامن تلقائيًا مع السحابة.</p>
+      <div class="row" style="gap:8px;flex-wrap:wrap;margin-top:10px">
+        <button class="btn" id="bk-now">⬇️ نسخة كاملة الآن (تنزيل xlsx + json)</button>
+      </div>
+      <p id="bk-status" class="muted" style="margin-top:8px"></p>
+    </div>
+    <div class="card" style="margin-top:12px">
+      <strong>الحفظ المباشر في مجلد على جهازك (مثل مجلد قسم المشتريات في OneDrive)</strong>
+      ${canPickFolder() ? `
+        <p class="muted" style="margin-top:6px">يعمل في Chrome/Edge على الكمبيوتر. تختار المجلد مرة واحدة والمتصفح يتذكره؛ بعدها زر واحد يكتب النسخة + المرفقات + نسخة طوارئ من الصفحة داخله. المتصفح قد يطلب تأكيد الإذن بعد إعادة فتحه.</p>
+        <p id="bk-folder" class="muted">المجلد المختار: …</p>
+        <div class="row" style="gap:8px;flex-wrap:wrap">
+          <button class="btn" id="bk-pick">📁 اختيار المجلد</button>
+          <button class="btn" id="bk-folder-run" disabled>💾 نسخة كاملة إلى المجلد</button>
+          <button class="btn small" id="bk-forget" style="display:none">إلغاء ربط المجلد</button>
+        </div>
+        <label style="display:flex;gap:6px;align-items:center;margin-top:8px"><input type="checkbox" id="bk-att" checked style="width:auto"> نسخ ملفات المرفقات أيضًا (الجديدة فقط في كل مرة)</label>`
+      : `<p class="muted" style="margin-top:6px">متصفحك لا يدعم الكتابة المباشرة في مجلد. استخدم زر "نسخة كاملة الآن" ثم انقل الملفين إلى المجلد، أو افتح المنظومة من Chrome/Edge.</p>`}
+    </div>
+    <div class="card" style="margin-top:12px">
+      <strong>سجل النسخ</strong>
+      <div style="overflow:auto;margin-top:8px"><table>
+        <thead><tr><th>الوقت</th><th>الوجهة</th><th>السجلات</th><th>تنبيهات</th><th>الملفات</th></tr></thead>
+        <tbody>${logs.length ? logs.map(l=>`<tr><td>${new Date(l.created_at).toLocaleString('ar-SA')}</td><td>${l.destination==='folder'?'مجلد':'تنزيل'}</td><td>${l.total_rows}</td><td>${(l.failed_tables||[]).length?escHtml((l.failed_tables||[]).join(' | ')):'—'}</td><td style="font-size:11px">${escHtml((l.file_names||[]).join(' · '))}</td></tr>`).join('') : '<tr><td colspan="5" class="muted">لا يوجد</td></tr>'}</tbody>
+      </table></div>
+    </div>`;
+  const ui = root.querySelector('#bk-status');
+  root.querySelector('#bk-now').onclick = () => runBackup('download', {}, ui);
+  if (!canPickFolder()) return;
+  const lbl = root.querySelector('#bk-folder'), runBtn = root.querySelector('#bk-folder-run'), forget = root.querySelector('#bk-forget');
+  const showDir = async () => {
+    const h = await idbGet('dir').catch(()=>null);
+    lbl.textContent = h ? `المجلد المختار: ${h.name}` : 'لم يُختر مجلد بعد';
+    runBtn.disabled = !h; forget.style.display = h ? '' : 'none';
+  };
+  showDir();
+  root.querySelector('#bk-pick').onclick = async () => {
+    try {
+      const h = await window.showDirectoryPicker({ mode:'readwrite', id:'erp-backup' });
+      await idbSet('dir', h); await showDir(); toast('تم ربط المجلد');
+    } catch(e){ if (e && e.name !== 'AbortError') toast('تعذّر اختيار المجلد: '+(e.message||e)); }
+  };
+  forget.onclick = async () => { await idbDel('dir'); await showDir(); };
+  runBtn.onclick = () => runBackup('folder', { attachments: root.querySelector('#bk-att').checked }, ui);
 }
 
 // ============================================================
