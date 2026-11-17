@@ -362,6 +362,36 @@ function shipSupplierNames(s){
   return [...new Set(shipPoIds(s).map(id=>{ const o=cache.orders.find(x=>x.id===id); return o?supplierName(o.supplier_id):null; }).filter(Boolean))];
 }
 function shipLabel(s){ const c = shipContainerList(s); return c.length ? c.join(' / ') : 'بدون رقم حاوية'; }
+// ----- رابط التتبع: رقم البوليصة (B/L) أو رابط كامل -----
+// مواقع الشركات الرسمية لا تقبل الرقم داخل الرابط، فنفتح صفحة التتبع وننسخ الرقم تلقائيًا للصقه.
+const TRACK_CARRIERS = [
+  { name:'MSC',     line:/msc|mediterranean/i,  bl:/^MEDU/i,         url:'https://www.msc.com/en/track-a-shipment' },
+  { name:'CMA CGM', line:/cma|cgm/i,            bl:/^CMDU/i,         url:'https://www.cma-cgm.com/ebusiness/tracking' },
+  { name:'ESL',     line:/\besl\b|emirates/i,   bl:/^(ESL|EMI)/i,    url:'https://www.emiratesline.com/track/' },
+];
+function trackInfo(shippingLine, value){
+  const v = String(value||'').trim();
+  if (!v) return null;
+  if (/^https?:\/\//i.test(v)) return { kind:'url', href:v };
+  const c = TRACK_CARRIERS.find(c=>c.line.test(shippingLine||'')) || TRACK_CARRIERS.find(c=>c.bl.test(v));
+  return c ? { kind:'ref', ref:v, href:c.url, carrier:c.name } : { kind:'ref', ref:v, href:null, carrier:null };
+}
+function trackCell(s){
+  const t = trackInfo(s.shipping_line, s.tracking_url);
+  if (!t) return '—';
+  if (t.kind === 'url') return `<a href="${escHtml(t.href)}" target="_blank" rel="noopener" class="btn small" style="color:var(--primary)">تتبع ↗</a>`;
+  if (!t.href) return `<span title="حدّد شركة الشحن (MSC / CMA / ESL) ليتحول الرقم لرابط">${escHtml(t.ref)}</span>`;
+  return `<a href="${t.href}" target="_blank" rel="noopener" class="btn small trk-copy" data-ref="${escHtml(t.ref)}" style="color:var(--primary)" title="ينسخ الرقم ويفتح موقع ${t.carrier}">${escHtml(t.ref)} ↗</a>`;
+}
+async function copyText(txt){
+  try { await navigator.clipboard.writeText(txt); return true; } catch(e){}
+  try { const ta = document.createElement('textarea'); ta.value = txt; ta.style.position='fixed'; ta.style.opacity='0'; document.body.appendChild(ta); ta.select(); const ok = document.execCommand('copy'); ta.remove(); return ok; } catch(e){ return false; }
+}
+document.addEventListener('click', async (e)=>{
+  const a = e.target.closest('.trk-copy'); if (!a) return;
+  const ok = await copyText(a.dataset.ref);
+  toast(ok ? `تم نسخ رقم البوليصة ${a.dataset.ref} — الصقه (Ctrl+V) في خانة البحث` : `انسخ الرقم يدويًا: ${a.dataset.ref}`);
+});
 function shipmentsFor(poId){ return cache.shipments.filter(s=>shipPoIds(s).includes(poId)); }
 function attachmentsFor(entityType, entityId){ return cache.attachments.filter(a=>a.entity_type===entityType && a.entity_id===entityId); }
 function receiptLinesFor(receiptId){ return cache.warehouseReceiptLines.filter(l=>l.receipt_id===receiptId); }
@@ -1085,7 +1115,6 @@ function impBuildPlan(rows, db){
     const contList = splitContainers(rec.container_number);
     const tq = impNum(r.total_quantity); if (tq.err) E('shipments', r._row, `الكمية الإجمالية "${r.total_quantity}" غير صحيحة`); rec.total_quantity = tq.v;
     for (const f of IMP_SHIP_DATES) { const d = impDate(r[f]); if (d.err) E('shipments', r._row, `تاريخ "${r[f]}" غير صحيح (YYYY-MM-DD)`); rec[f] = d.v; }
-    if (rec.tracking_url && !/^https?:\/\//i.test(rec.tracking_url)) E('shipments', r._row, 'رابط التتبع يجب أن يبدأ بـ http:// أو https://');
     if (errors.length > before || !ref) continue;
     if (ref.existing) {
       if (contList.length && contList.every(c => db.shipments.some(s => shipPoIds(s).includes(ref.existing.id) && shipContainerList(s).some(x => key(x) === key(c))))) {
@@ -2053,7 +2082,7 @@ function renderShipments(root){
       ${bulkBarHtml('shipments', list)}
       <div style="overflow:auto;max-height:60vh">
       <table>
-        <thead><tr>${bulkThHtml('shipments', list)}<th>الأوامر</th><th>الموردون</th><th>الحاويات</th><th>شركة الشحن</th><th>تاريخ طلب الحاوية</th><th>الوصول المتوقع</th><th>الوصول الفعلي</th><th>الكمية الإجمالية</th><th>آخر محطة</th><th>الحالة</th><th>التتبع</th><th>تحديث بواسطة</th><th></th></tr></thead>
+        <thead><tr>${bulkThHtml('shipments', list)}<th>الأوامر</th><th>الموردون</th><th>الحاويات</th><th>شركة الشحن</th><th>تاريخ طلب الحاوية</th><th>الوصول المتوقع</th><th>الوصول الفعلي</th><th>الكمية الإجمالية</th><th>آخر محطة</th><th>الحالة</th><th>التتبع (رقم البوليصة)</th><th>تحديث بواسطة</th><th></th></tr></thead>
         <tbody>
           ${list.map(s=>{
             const lastDone = SHIP_MILESTONES.filter(m=>s[m[0]]).pop();
@@ -2071,7 +2100,7 @@ function renderShipments(root){
               <td>${qty!=null&&qty!==''?fmtNum(qty):'—'}${nItems>1?` <span class="muted">(${nItems} أصناف)</span>`:''}</td>
               <td>${lastDone?lastDone[1]:'—'} <span class="muted">(${progress}/${SHIP_MILESTONES.length})</span></td>
               <td>${escHtml(s.status)||'—'}</td>
-              <td>${s.tracking_url ? `<a href="${escHtml(s.tracking_url)}" target="_blank" rel="noopener" class="btn small" style="color:var(--primary)">تتبع ↗</a>` : '—'}</td>
+              <td>${trackCell(s)}</td>
               <td>${userLabel(s.updated_by)}</td>
               <td>${(canAdd||canWarehouse())?`<button class="btn small" data-id="${s.id}" data-act="edit-ship">${canEditExisting()?'تعديل':'عرض'}</button>`:''}</td>
             </tr>`;
@@ -2085,7 +2114,7 @@ function renderShipments(root){
     const itemsTxt = shipItems(s.id).map(i=>`${cache.orders.find(o=>o.id===i.po_id)?.po_number||'—'}: ${i.item_name||'—'} × ${i.quantity??'—'}`).join(' ؛ ');
     const row = { أوامر_الشراء: shipPoNumbers(s).join('، '), الموردون: shipSupplierNames(s).join('، '), أرقام_الحاويات: shipContainerList(s).join(' / '), شركة_الشحن: s.shipping_line,
       تاريخ_طلب_الحاوية: s.container_order_date, الأصناف: itemsTxt || s.container_contents, الكمية_الإجمالية: shipTotalQty(s),
-      رابط_التتبع: s.tracking_url, الحالة: s.status, تم_التحديث_بواسطة: userLabel(s.updated_by), ملاحظات: s.notes };
+      رقم_البوليصة_أو_رابط_التتبع: s.tracking_url, الحالة: s.status, تم_التحديث_بواسطة: userLabel(s.updated_by), ملاحظات: s.notes };
     SHIP_MILESTONES.forEach(m=>row[m[1]]=s[m[0]]); return row;
   }), 'shipments');
   if (canAdd) root.querySelector('#add-ship').onclick = () => openShipmentModal(null);
@@ -2125,10 +2154,10 @@ function openShipmentModal(ship){
       <p class="muted" style="margin-top:6px">الكمية الإجمالية: <strong id="s-total-qty">0</strong> <span>(مجموع كميات الأصناف)</span></p>
     </div>
     <div class="row">
-      <div class="field"><label>شركة الشحن</label><input id="s-shipping_line" value="${escHtml(ship?.shipping_line)}" placeholder="مثال: MSC, Maersk, CMA CGM"></div>
+      <div class="field"><label>شركة الشحن</label><input id="s-shipping_line" list="ship-lines" value="${escHtml(ship?.shipping_line)}" placeholder="مثال: MSC, CMA CGM, ESL"><datalist id="ship-lines">${TRACK_CARRIERS.map(c=>`<option value="${c.name}"></option>`).join('')}</datalist></div>
       <div class="field"><label>تاريخ طلب الحاوية</label><input type="date" id="s-container_order_date" value="${ship?.container_order_date||''}"></div>
     </div>
-    <div class="field"><label>رابط التتبع</label><input id="s-tracking_url" value="${escHtml(ship?.tracking_url)}" placeholder="https://..."></div>
+    <div class="field"><label>رقم البوليصة (B/L) أو رابط التتبع</label><input id="s-tracking_url" value="${escHtml(ship?.tracking_url)}" placeholder="مثال: MEDUAFE39772 — أو رابط كامل https://..."><p class="muted" id="s-trk-preview" style="margin-top:4px"></p></div>
     <div class="row">
       ${SHIP_MILESTONES.map(([key,label])=>`<div class="field"><label>${label}</label><input type="date" id="s-${key}" value="${ship?.[key]||''}"></div>`).join('')}
     </div>
@@ -2192,6 +2221,13 @@ function openShipmentModal(ship){
       root.querySelector('#si-add').onclick = () => { sync(); items.push({ id:null, po_id:items[items.length-1]?.po_id||'', name:'', qty:'' }); renderRows(); };
     }
     root.querySelector('#cancel-ship').onclick = closeModal;
+    const trkPreview = () => {
+      const el = root.querySelector('#s-trk-preview'); if (!el) return;
+      const t = trackInfo(val('s-shipping_line'), val('s-tracking_url'));
+      el.innerHTML = !t ? '' : t.kind==='url' ? `✓ رابط تتبع مباشر` : t.href ? `✓ سيظهر كرابط يفتح موقع <strong>${t.carrier}</strong> وينسخ الرقم تلقائيًا` : `⚠ اكتب شركة الشحن (MSC / CMA / ESL) ليتحول الرقم لرابط`;
+    };
+    ['s-tracking_url','s-shipping_line'].forEach(id=>root.querySelector('#'+id).addEventListener('input', trkPreview));
+    trkPreview();
 
     if (editable) root.querySelector('#save-ship').onclick = async () => {
       sync();
