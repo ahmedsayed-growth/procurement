@@ -197,7 +197,7 @@ function emailFor(input){
 let currentUser = null;
 let currentProfile = null;
 let activeTab = 'dashboard';
-let cache = { suppliers:[], orders:[], lines:[], payments:[], shipments:[], shipmentItems:[], shipmentContainers:[], season:[], profiles:[], audit:[], attachments:[], samples:[], warehouseReceipts:[], warehouseReceiptLines:[], paymentComments:[], financePayments:[], backupLog:[] };
+let cache = { suppliers:[], orders:[], lines:[], payments:[], shipments:[], shipmentItems:[], shipmentContainers:[], season:[], profiles:[], audit:[], attachments:[], samples:[], warehouseReceipts:[], warehouseReceiptLines:[], warehouseReceiptPos:[], paymentComments:[], financePayments:[], backupLog:[] };
 let chartInstances = {};
 let selectedOrderIds = new Set();
 let dashFilter = { from:'', to:'', supplier:'', category:'' };
@@ -303,7 +303,7 @@ async function refreshAll(){
   }
   const isOwner = role === 'owner';
   const empty = Promise.resolve({ data: [] });
-  const [s,o,l,p,sh,sp,pr,au,at,sm,wr,wl,pc,si,sc,bl] = await Promise.all([
+  const [s,o,l,p,sh,sp,pr,au,at,sm,wr,wl,pc,si,sc,bl,wp] = await Promise.all([
     sb.from('erp_suppliers').select('*').order('name'),
     sb.from('erp_purchase_orders').select('*').order('created_at',{ascending:false}),
     sb.from('erp_po_line_items').select('*').order('created_at'),
@@ -320,6 +320,7 @@ async function refreshAll(){
     sb.from('erp_shipment_items').select('*').order('created_at'),
     sb.from('erp_shipment_containers').select('*').order('created_at'),
     isOwner ? sb.from('erp_backup_log').select('*').order('created_at',{ascending:false}).limit(30) : empty,
+    sb.from('erp_warehouse_receipt_pos').select('*').order('created_at'),
   ]);
   cache.suppliers = s.data||[];
   cache.orders = o.data||[];
@@ -336,6 +337,7 @@ async function refreshAll(){
   cache.samples = sm.data||[];
   cache.warehouseReceipts = wr.data||[];
   cache.warehouseReceiptLines = wl.data||[];
+  cache.warehouseReceiptPos = wp.data||[];
   cache.paymentComments = pc.data||[];
 }
 
@@ -2656,6 +2658,23 @@ function openSampleModal(sample){
 // ============================================================
 // WAREHOUSE RECEIVING — استلام المستودع (تأكيد الوصول والكميات الفعلية)
 // ============================================================
+// ----- استلام المستودع: استلام واحد قد يغطي أكثر من أمر شراء (شحنة واحدة) -----
+function receiptPoIds(r){
+  const ids = [...new Set(cache.warehouseReceiptPos.filter(x=>x.receipt_id===r.id).map(x=>x.po_id))];
+  if (r.po_id && !ids.includes(r.po_id)) ids.unshift(r.po_id); // استلامات قديمة بأمر واحد
+  return ids;
+}
+function receiptPoNumbers(r){ return receiptPoIds(r).map(id=>cache.orders.find(o=>o.id===id)?.po_number||'—'); }
+function receiptSupplierNames(r){
+  return [...new Set(receiptPoIds(r).map(id=>{ const o=cache.orders.find(x=>x.id===id); return o?supplierName(o.supplier_id):null; }).filter(Boolean))];
+}
+function receiptTotals(r){
+  const ls = receiptLinesFor(r.id);
+  return { n: ls.length,
+    exp: ls.reduce((a,l)=>a+(Number(l.ordered_quantity)||0),0),
+    rcv: ls.reduce((a,l)=>a+(Number(l.received_quantity)||0),0) };
+}
+
 function renderWarehouseReceipts(root){
   const canAdd = canWriteReceipts();
   root.innerHTML = `
@@ -2670,21 +2689,24 @@ function renderWarehouseReceipts(root){
       ${bulkBarHtml('receipts', cache.warehouseReceipts)}
       <div style="overflow:auto;max-height:60vh">
       <table>
-        <thead><tr>${bulkThHtml('receipts', cache.warehouseReceipts)}<th>الأمر</th><th>المورد</th><th>الحاوية</th><th>موقع المستودع</th><th>تاريخ الاستلام</th><th>استلم بواسطة</th><th>الحالة</th><th>حالة البضاعة</th><th></th></tr></thead>
+        <thead><tr>${bulkThHtml('receipts', cache.warehouseReceipts)}<th>الأوامر</th><th>المورد</th><th>الحاوية</th><th>موقع المستودع</th><th>تاريخ الاستلام</th><th>استلم بواسطة</th><th>الحالة</th><th>حالة البضاعة</th><th>المستلم / المتوقع</th><th></th></tr></thead>
         <tbody>
           ${cache.warehouseReceipts.map(r=>{
-            const po = cache.orders.find(o=>o.id===r.po_id);
             const ship = cache.shipments.find(s=>s.id===r.shipment_id);
             const condBad = r.condition_status && r.condition_status !== 'سليمة بالكامل';
+            const pos = receiptPoNumbers(r), sups = receiptSupplierNames(r), t = receiptTotals(r);
+            const diff = t.rcv - t.exp;
+            const tot = t.n ? `${fmtNum(t.rcv)} / ${fmtNum(t.exp)} ${diff===0?'<span class="badge ok">مطابق</span>':`<span class="badge ${diff<0?'bad':'warn'}">${diff>0?'+':''}${fmtNum(diff)}</span>`}` : '—';
             return `<tr>
-              ${bulkTdHtml('receipts', r.id)}<td>${po?po.po_number||'—':'—'}</td>
-              <td>${po?supplierName(po.supplier_id):'—'}</td>
-              <td>${ship?shipLabel(ship):'—'}</td>
+              ${bulkTdHtml('receipts', r.id)}<td>${pos.length?pos.map(escHtml).join('، '):'—'}</td>
+              <td>${sups.length?sups.map(escHtml).join('، '):'—'}</td>
+              <td>${ship?escHtml(shipLabel(ship)):'—'}</td>
               <td>${r.warehouse_location||'—'}</td>
               <td>${fmtDate(r.received_date)}</td>
               <td>${r.received_by_name||'—'}</td>
               <td>${r.status||'—'}</td>
               <td>${condBad?`<span class="badge bad">${r.condition_status}</span>`:(r.condition_status||'—')}</td>
+              <td>${tot}</td>
               <td>${canAdd?`<button class="btn small" data-id="${r.id}" data-act="edit-wh">${canEditReceipts()?'تعديل':'عرض'}</button>`:''}</td>
             </tr>`;
           }).join('')}
@@ -2693,11 +2715,25 @@ function renderWarehouseReceipts(root){
       </div>
     </div>
   `;
-  root.querySelector('#exp-wh').onclick = () => exportToExcel(cache.warehouseReceipts.map(r=>{
-    const po = cache.orders.find(o=>o.id===r.po_id);
-    return { رقم_الأمر: po?.po_number, المورد: po?supplierName(po.supplier_id):'', موقع_المستودع: r.warehouse_location,
-      تاريخ_الاستلام: r.received_date, استلم_بواسطة: r.received_by_name, الحالة: r.status, حالة_البضاعة: r.condition_status, ملاحظات: r.notes };
-  }), 'warehouse_receipts');
+  // التصدير: صف لكل بند استلام (والاستلام بلا بنود يظهر في صف واحد)
+  root.querySelector('#exp-wh').onclick = () => {
+    const rows = [];
+    cache.warehouseReceipts.forEach(r=>{
+      const base = { الأوامر: receiptPoNumbers(r).join(' ، '), الموردون: receiptSupplierNames(r).join(' ، '),
+        الحاوية: (()=>{ const s=cache.shipments.find(x=>x.id===r.shipment_id); return s?shipLabel(s):''; })(),
+        موقع_المستودع: r.warehouse_location, تاريخ_الاستلام: r.received_date, استلم_بواسطة: r.received_by_name,
+        الحالة: r.status, حالة_البضاعة: r.condition_status, ملاحظات: r.notes };
+      const ls = receiptLinesFor(r.id);
+      if (!ls.length) { rows.push({ ...base, أمر_البند:'', الصنف:'', المتوقع:'', المستلم:'', الفرق:'', ملاحظات_الفرق:'' }); return; }
+      ls.forEach(l=>{
+        const po = cache.orders.find(o=>o.id===(l.po_id || cache.lines.find(x=>x.id===l.po_line_item_id)?.po_id));
+        const exp = l.ordered_quantity!=null ? Number(l.ordered_quantity) : null;
+        rows.push({ ...base, أمر_البند: po?po.po_number:'', الصنف: l.item_name, المتوقع: exp, المستلم: Number(l.received_quantity),
+          الفرق: exp!=null ? Number(l.received_quantity)-exp : '', ملاحظات_الفرق: l.discrepancy_notes });
+      });
+    });
+    exportToExcel(rows, 'warehouse_receipts');
+  };
   if (canAdd) root.querySelector('#add-wh').onclick = () => openWarehouseReceiptModal(null);
   root.querySelectorAll('[data-act="edit-wh"]').forEach(b=>{
     b.onclick = () => openWarehouseReceiptModal(cache.warehouseReceipts.find(r=>r.id===b.dataset.id));
@@ -2705,143 +2741,305 @@ function renderWarehouseReceipts(root){
   wireBulk(root, 'receipts', cache.warehouseReceipts, { table:'erp_warehouse_receipts', label:'استلام', plural:'استلامات المستودع', attachType:'receipt', note:'(بكل بنودها)' });
 }
 
-function renderReceiptLinesBlock(receipt){
-  const lines = receiptLinesFor(receipt.id);
-  return `
-    <div class="card" style="margin-top:10px">
-      <div class="toolbar"><strong>بنود الاستلام (الكميات الفعلية)</strong>${canWriteReceipts()?'<button class="btn small" id="add-receipt-line">+ بند استلام</button>':''}</div>
-      <table>
-        <thead><tr><th>الصنف</th><th>الكمية المطلوبة</th><th>الكمية المستلمة فعليًا</th><th>الفرق</th><th>ملاحظات</th><th></th></tr></thead>
-        <tbody id="receipt-lines-body">
-        ${lines.map(l=>{
-          const diff = (l.received_quantity||0) - (l.ordered_quantity||0);
-          const diffBadge = diff===0 ? '<span class="badge ok">مطابق</span>' : `<span class="badge ${diff<0?'bad':'warn'}">${diff>0?'+':''}${fmtNum(diff)}</span>`;
-          return `<tr>
-            <td>${l.item_name}</td><td>${l.ordered_quantity!=null?fmtNum(l.ordered_quantity):'—'}</td>
-            <td>${fmtNum(l.received_quantity)}</td>
-            <td>${diffBadge}</td>
-            <td>${l.discrepancy_notes||'—'}</td>
-            <td>${canDelete()?`<button class="btn small" data-lid="${l.id}" data-act="del-receipt-line">حذف</button>`:''}</td>
-          </tr>`;
-        }).join('')}
-        </tbody>
-      </table>
-    </div>
-  `;
-}
-
-function wireReceiptLinesBlock(root, receipt){
-  const addBtn = root.querySelector('#add-receipt-line');
-  if (addBtn) addBtn.onclick = () => {
-    const poLines = receipt.po_id ? linesFor(receipt.po_id) : [];
-    openModal(`
-      <h3>بند استلام جديد</h3>
-      ${poLines.length ? `<div class="field"><label>اختر من بنود الأمر (اختياري)</label><select id="rl-po_line_item_id"><option value="">— إدخال يدوي —</option>${poLines.map(l=>`<option value="${l.id}">${l.item_name} (المطلوب: ${fmtNum(l.quantity)})</option>`).join('')}</select></div>` : ''}
-      <div class="field"><label>اسم الصنف</label><input id="rl-item_name"></div>
-      <div class="row">
-        <div class="field"><label>الكمية المطلوبة (حسب الأمر)</label><input type="number" step="0.01" id="rl-ordered_quantity"></div>
-        <div class="field"><label>الكمية المستلمة فعليًا</label><input type="number" step="0.01" id="rl-received_quantity"></div>
-      </div>
-      <div class="field"><label>الوحدة</label><input id="rl-unit"></div>
-      <div class="field"><label>ملاحظات الفرق (إن وجد)</label><textarea id="rl-discrepancy_notes" placeholder="مثال: تلف في الشحن، نقص من المورد..."></textarea></div>
-      <div class="row" style="margin-top:14px">
-        <button class="btn primary" id="save-receipt-line">حفظ</button>
-        <button class="btn" id="back-receipt-line">رجوع</button>
-      </div>
-    `, (r2)=>{
-      const sel = r2.querySelector('#rl-po_line_item_id');
-      if (sel) sel.addEventListener('change', () => {
-        const line = poLines.find(l=>l.id===sel.value);
-        if (line) {
-          r2.querySelector('#rl-item_name').value = line.item_name;
-          r2.querySelector('#rl-ordered_quantity').value = line.quantity;
-        }
-      });
-      r2.querySelector('#back-receipt-line').onclick = () => openWarehouseReceiptModal(receipt);
-      r2.querySelector('#save-receipt-line').onclick = async () => {
-        const payload = {
-          receipt_id: receipt.id,
-          po_line_item_id: sel ? (sel.value || null) : null,
-          item_name: val('rl-item_name'),
-          ordered_quantity: parseFloat(val('rl-ordered_quantity'))||null,
-          received_quantity: parseFloat(val('rl-received_quantity'))||0,
-          unit: val('rl-unit')||null,
-          discrepancy_notes: val('rl-discrepancy_notes')||null,
-          created_by: currentUser.id,
-        };
-        const { error } = await sb.from('erp_warehouse_receipt_lines').insert(payload);
-        if (error) { toast('خطأ: '+error.message); return; }
-        await refreshAll();
-        openWarehouseReceiptModal(cache.warehouseReceipts.find(r=>r.id===receipt.id));
-      };
-    });
-  };
-  root.querySelectorAll('[data-act="del-receipt-line"]').forEach(b=>{
-    b.onclick = async () => {
-      if (!confirm('حذف هذا البند؟')) return;
-      const { error } = await sb.from('erp_warehouse_receipt_lines').delete().eq('id', b.dataset.lid);
-      if (error) { toast('خطأ: '+error.message); return; }
-      await refreshAll();
-      openWarehouseReceiptModal(cache.warehouseReceipts.find(r=>r.id===receipt.id));
-    };
-  });
-}
-
 function openWarehouseReceiptModal(receipt){
   const isEdit = !!receipt;
   const editable = !isEdit ? canWriteReceipts() : canEditReceipts();
+  const dis = editable ? '' : 'disabled';
   const attachments = isEdit ? attachmentsFor('receipt', receipt.id) : [];
+  const existingLines = isEdit ? receiptLinesFor(receipt.id) : [];
+  const lineOwnerPo = l => l.po_id || cache.lines.find(x=>x.id===l.po_line_item_id)?.po_id || receipt?.po_id || null;
+
+  let shipId = receipt?.shipment_id || '';
+  const sel = isEdit ? receiptPoIds(receipt) : [];
+  existingLines.forEach(l=>{ const p = lineOwnerPo(l); if (p && !sel.includes(p)) sel.push(p); });
+  const savedPoSet = new Set(existingLines.map(lineOwnerPo).filter(Boolean)); // أوامر لها بنود محفوظة: لا تُزال من هنا
+  const originallyNoPo = isEdit && receiptPoIds(receipt).length === 0;
+  const rows = new Map();
+  const usedLines = new Set();
+  let seq = 0, statusTouched = false;
+
+  // ----- حالة الصفوف (واحد لكل صنف في الأمر + أصناف يدوية) -----
+  function ensureRows(poId){
+    linesFor(poId).forEach(pl=>{
+      const key = 'L:'+pl.id;
+      if (rows.has(key)) return;
+      const ex = existingLines.find(l=>l.po_line_item_id===pl.id && !usedLines.has(l.id));
+      if (ex) usedLines.add(ex.id);
+      rows.set(key, { key, po_id:poId, po_line_item_id:pl.id, item_name:pl.item_name, ordered:Number(pl.quantity)||0,
+        received: ex ? String(ex.received_quantity) : '', notes: ex?.discrepancy_notes||'', lineId: ex?.id||null, manual:false });
+    });
+    existingLines.filter(l=>!usedLines.has(l.id) && lineOwnerPo(l)===poId).forEach(l=>{
+      usedLines.add(l.id);
+      rows.set('M:'+l.id, { key:'M:'+l.id, po_id:poId, po_line_item_id:l.po_line_item_id||null, item_name:l.item_name,
+        ordered:null, expSaved: l.ordered_quantity!=null?Number(l.ordered_quantity):null,
+        received:String(l.received_quantity), notes:l.discrepancy_notes||'', lineId:l.id, manual:true });
+    });
+  }
+  sel.forEach(ensureRows);
+
+  // الكمية المتوقعة: كمية هذا الصنف في الشحنة المختارة إن وُجدت أصناف للأمر، وإلا كمية الأمر
+  function shipQty(poId, plId){
+    if (!shipId) return null;
+    const its = shipItems(shipId).filter(i=>i.po_id===poId);
+    if (!its.length) return null;
+    return its.filter(i=>i.po_line_item_id===plId).reduce((a,i)=>a+(Number(i.quantity)||0),0);
+  }
+  function expOf(r){
+    if (r.manual) return r.expSaved!=null ? r.expSaved : null;
+    const s = shipQty(r.po_id, r.po_line_item_id);
+    return s!=null ? s : r.ordered;
+  }
+  function diffHtml(r){
+    if (r.received==='' || isNaN(Number(r.received))) return '<span class="muted">—</span>';
+    const e = expOf(r); if (e==null) return '<span class="muted">—</span>';
+    const d = Number(r.received) - e;
+    return d===0 ? '<span class="badge ok">مطابق</span>' : `<span class="badge ${d<0?'bad':'warn'}">${d>0?'+':''}${fmtNum(d)}</span>`;
+  }
+  function poRows(poId){
+    const list = [...rows.values()].filter(r=>r.po_id===poId);
+    const inShip = r => (r.manual || shipQty(r.po_id, r.po_line_item_id)!==0) ? 0 : 1;
+    return list.sort((a,b)=>inShip(a)-inShip(b)); // الأصناف داخل الشحنة أولاً (الترتيب الأصلي يُحفظ)
+  }
+  function totalsHtml(poId){
+    const rs = poRows(poId);
+    const exp = rs.reduce((a,r)=>a+(expOf(r)||0),0);
+    const rcv = rs.reduce((a,r)=>a+(r.received!==''&&!isNaN(Number(r.received))?Number(r.received):0),0);
+    return `<td><strong>الإجمالي</strong></td><td colspan="${shipColVisible(poId)?2:1}"><strong>${fmtNum(exp)}</strong></td><td><strong>${fmtNum(rcv)}</strong></td><td colspan="3"></td>`;
+  }
+  function shipColVisible(poId){ return !!shipId && shipItems(shipId).some(i=>i.po_id===poId); }
+
+  function itemsHtml(){
+    if (!sel.length) return '<p class="muted" style="margin-top:8px">اختر أمر شراء واحدًا أو أكثر لتظهر أصنافه هنا وتسجّل الكمية المستلمة فعليًا.</p>';
+    return sel.map(poId=>{
+      const o = cache.orders.find(x=>x.id===poId);
+      const showShip = shipColVisible(poId);
+      const body = poRows(poId).map(r=>{
+        const sh = r.manual ? null : shipQty(r.po_id, r.po_line_item_id);
+        const dim = sh===0 ? 'opacity:.55' : '';
+        const nameCell = (r.manual && !r.po_line_item_id) ? `<input class="wh-name" value="${escHtml(r.item_name)}" placeholder="اسم الصنف" ${dis}>` : escHtml(r.item_name) + (sh===0?' <span class="muted">(غير مدرج في الشحنة)</span>':'') + (r.manual?' <span class="badge info">خارج الأمر</span>':'');
+        const delBtn = r.lineId ? (canDelete()?`<button type="button" class="btn small wh-delrow" data-key="${r.key}">حذف</button>`:'')
+                                : (r.manual && editable ? `<button type="button" class="btn small wh-rmrow" data-key="${r.key}">×</button>` : '');
+        return `<tr data-key="${r.key}" style="${dim}">
+          <td>${nameCell}</td>
+          <td>${r.ordered!=null?fmtNum(r.ordered):'—'}</td>
+          ${showShip?`<td>${sh!=null?fmtNum(sh):'—'}</td>`:''}
+          <td><input class="wh-rcv" type="number" step="0.01" min="0" inputmode="decimal" value="${escHtml(r.received)}" style="width:110px" ${dis}></td>
+          <td class="wh-diff">${diffHtml(r)}</td>
+          <td><input class="wh-note" value="${escHtml(r.notes)}" placeholder="ملاحظة الفرق" ${dis}></td>
+          <td>${delBtn}</td>
+        </tr>`;
+      }).join('');
+      return `<div class="card" data-po="${poId}" style="margin-top:10px">
+        <div class="toolbar"><strong>أمر ${escHtml(o?.po_number||'(بلا رقم)')} — ${escHtml(o?supplierName(o.supplier_id):'')}</strong>
+          ${editable?`<div class="row" style="flex:0;gap:6px"><button type="button" class="btn small wh-fill" data-po="${poId}">تعبئة الفارغ بالمتوقع</button><button type="button" class="btn small wh-addrow" data-po="${poId}">+ صنف خارج الأمر</button></div>`:''}</div>
+        <div style="overflow:auto"><table>
+          <thead><tr><th>الصنف</th><th>المطلوب (الأمر)</th>${showShip?'<th>في الشحنة</th>':''}<th>المستلم فعليًا</th><th>الفرق</th><th>ملاحظات</th><th></th></tr></thead>
+          <tbody>${body || '<tr><td colspan="7" class="muted">لا توجد أصناف في هذا الأمر — أضف صنفًا يدويًا.</td></tr>'}</tbody>
+          <tfoot><tr class="wh-tot" data-po="${poId}">${totalsHtml(poId)}</tr></tfoot>
+        </table></div>
+      </div>`;
+    }).join('');
+  }
+  function chipsHtml(){
+    return sel.map(id=>{
+      const o = cache.orders.find(x=>x.id===id), locked = savedPoSet.has(id);
+      return `<span class="badge info" style="padding:4px 8px;margin:2px;display:inline-flex;gap:6px;align-items:center">${escHtml(o?.po_number||'(بلا رقم)')} — ${escHtml(o?supplierName(o.supplier_id):'')}${editable?` <button type="button" class="btn small wh-rmpo" data-po="${id}" style="padding:0 6px" ${locked?'disabled title="لهذا الأمر بنود محفوظة — يحذف المالك بنوده أولاً"':''}>×</button>`:''}</span>`;
+    }).join('') || '<span class="muted">لم يُختر أي أمر بعد</span>';
+  }
+  function addPoOptions(){
+    const rest = cache.orders.filter(o=>!sel.includes(o.id));
+    const inShip = shipId ? rest.filter(o=>shipPoIds(cache.shipments.find(s=>s.id===shipId)||{id:''}).includes(o.id)) : [];
+    const others = rest.filter(o=>!inShip.includes(o));
+    const opt = o => `<option value="${o.id}">${escHtml(o.po_number||'(بلا رقم)')} — ${escHtml(supplierName(o.supplier_id))}</option>`;
+    return `<option value="">＋ أضف أمر شراء…</option>` +
+      (inShip.length?`<optgroup label="أوامر الشحنة المختارة">${inShip.map(opt).join('')}</optgroup>`:'') +
+      (others.length?`<optgroup label="باقي الأوامر">${others.map(opt).join('')}</optgroup>`:'');
+  }
+  function shipOptions(){
+    return cache.shipments.map(s=>`<option value="${s.id}" ${shipId===s.id?'selected':''}>${escHtml(shipLabel(s))} — أوامر: ${escHtml(shipPoNumbers(s).join('، ')||'—')}</option>`).join('');
+  }
+
   openModal(`
-    <h3>${isEdit?'تعديل استلام مستودع':'استلام مستودع جديد'}</h3>
+    <h3>${isEdit?(editable?'تعديل استلام مستودع':'عرض استلام مستودع'):'استلام مستودع جديد'}</h3>
+    <div class="field"><label>الشحنة (اختياري) — عند اختيارها تُضاف أوامرها تلقائيًا</label>
+      <select id="wh-shipment_id" ${dis}><option value="">—</option>${shipOptions()}</select></div>
+    <div class="field"><label>أوامر الشراء في هذا الاستلام (يمكن أكثر من أمر)</label>
+      <div id="wh-chips">${chipsHtml()}</div>
+      ${editable?`<select id="wh-addpo" style="margin-top:6px">${addPoOptions()}</select>`:''}</div>
     <div class="row">
-      <div class="field"><label>أمر الشراء</label><select id="wh-po_id"><option value="">—</option>${orderOptions(receipt?.po_id)}</select></div>
-      <div class="field"><label>الشحنة (اختياري)</label><select id="wh-shipment_id"><option value="">—</option>${cache.shipments.map(s=>`<option value="${s.id}" ${receipt?.shipment_id===s.id?'selected':''}>${escHtml(shipLabel(s))}</option>`).join('')}</select></div>
-    </div>
-    <div class="row">
-      <div class="field"><label>موقع المستودع</label><input id="wh-warehouse_location" list="wh-locations" value="${receipt?.warehouse_location||''}" placeholder="مثال: المستودع الرئيسي، مستودع خمرة">
+      <div class="field"><label>موقع المستودع</label><input id="wh-warehouse_location" list="wh-locations" value="${escHtml(receipt?.warehouse_location||'')}" placeholder="مثال: المستودع الرئيسي، مستودع خمرة" ${dis}>
         <datalist id="wh-locations"><option value="المستودع الرئيسي"><option value="مستودع خمرة"></datalist>
       </div>
-      <div class="field"><label>تاريخ الاستلام</label><input type="date" id="wh-received_date" value="${receipt?.received_date||today}"></div>
+      <div class="field"><label>تاريخ الاستلام</label><input type="date" id="wh-received_date" value="${receipt?.received_date||today}" ${dis}></div>
     </div>
     <div class="row">
-      <div class="field"><label>استلم بواسطة</label><input id="wh-received_by_name" value="${receipt?.received_by_name||''}" placeholder="اسم مسؤول المستودع"></div>
-      <div class="field"><label>الحالة</label><select id="wh-status">${['مستلم جزئياً','مستلم بالكامل','به فروقات'].map(s=>`<option value="${s}" ${receipt?.status===s?'selected':''}>${s}</option>`).join('')}</select></div>
+      <div class="field"><label>استلم بواسطة</label><input id="wh-received_by_name" value="${escHtml(receipt?.received_by_name||'')}" placeholder="اسم مسؤول المستودع" ${dis}></div>
+      <div class="field"><label>الحالة</label><select id="wh-status" ${dis}>${['مستلم جزئياً','مستلم بالكامل','به فروقات'].map(s=>`<option value="${s}" ${receipt?.status===s?'selected':''}>${s}</option>`).join('')}</select></div>
     </div>
-    <div class="field"><label>حالة البضاعة المستلمة</label><select id="wh-condition_status">${['سليمة بالكامل','تالفة جزئيًا','تالفة كليًا'].map(s=>`<option value="${s}" ${(receipt?.condition_status||'سليمة بالكامل')===s?'selected':''}>${s}</option>`).join('')}</select></div>
-    <div class="field"><label>ملاحظات</label><textarea id="wh-notes">${receipt?.notes||''}</textarea></div>
+    <div class="field"><label>حالة البضاعة المستلمة</label><select id="wh-condition_status" ${dis}>${['سليمة بالكامل','تالفة جزئيًا','تالفة كليًا'].map(s=>`<option value="${s}" ${(receipt?.condition_status||'سليمة بالكامل')===s?'selected':''}>${s}</option>`).join('')}</select></div>
+    <div class="field"><label>ملاحظات</label><textarea id="wh-notes" ${dis}>${escHtml(receipt?.notes||'')}</textarea></div>
 
-    ${isEdit ? renderReceiptLinesBlock(receipt) : '<p class="muted" style="margin-top:8px">اضغط "حفظ" أولاً — ستفتح النافذة تلقائيًا لإضافة بنود الاستلام وإرفاق صور حالة البضاعة.</p>'}
-    ${isEdit ? renderAttachmentsBlock('receipt', receipt.id, attachments) : ''}
+    <div style="margin-top:6px"><strong>أصناف الاستلام (الكميات الفعلية)</strong>
+      <div class="muted">المتوقع = كمية الصنف في الشحنة المختارة إن وُجدت، وإلا كمية الأمر. اترك الصنف فارغًا إن لم يصل.</div></div>
+    <div id="wh-items">${itemsHtml()}</div>
+
+    ${isEdit ? renderAttachmentsBlock('receipt', receipt.id, attachments) : '<p class="muted" style="margin-top:8px">بعد الحفظ تُفتح النافذة تلقائيًا لإرفاق صور حالة البضاعة.</p>'}
 
     <div class="row" style="margin-top:14px">
       ${editable ? '<button class="btn primary" id="save-wh">حفظ</button>' : ''}
       <button class="btn" id="cancel-wh">إغلاق</button>
-      ${isEdit && canDelete() ? `<button class="btn danger" id="del-wh">حذف</button>` : ''}
+      ${isEdit && canDelete() ? `<button class="btn danger" id="del-wh">حذف الاستلام</button>` : ''}
     </div>
   `, (root)=>{
+    root.querySelector('.modal').style.maxWidth = '980px';
+    const itemsEl = root.querySelector('#wh-items'), chipsEl = root.querySelector('#wh-chips');
+    const addSel = root.querySelector('#wh-addpo'), shipSel = root.querySelector('#wh-shipment_id'), statusSel = root.querySelector('#wh-status');
+    statusSel.addEventListener('change', ()=>{ statusTouched = true; });
+
+    function redrawPos(){
+      itemsEl.innerHTML = itemsHtml(); chipsEl.innerHTML = chipsHtml();
+      if (addSel) addSel.innerHTML = addPoOptions();
+    }
+    function suggestStatus(){
+      if (!editable || statusTouched) return;
+      const rs = [...rows.values()];
+      const filled = rs.filter(r=>r.received!=='' && !isNaN(Number(r.received)));
+      if (!filled.length) return;
+      const anyDiff = filled.some(r=>{ const e=expOf(r); return e!=null && Number(r.received)!==e; });
+      const allCovered = rs.filter(r=>!r.manual && (expOf(r)||0)>0).every(r=>r.received!=='');
+      statusSel.value = anyDiff ? 'به فروقات' : (allCovered ? 'مستلم بالكامل' : 'مستلم جزئياً');
+    }
+    function addPo(poId){
+      if (!poId || sel.includes(poId)) return;
+      sel.push(poId); ensureRows(poId);
+    }
+
     root.querySelector('#cancel-wh').onclick = closeModal;
+    if (editable) {
+      shipSel.onchange = () => {
+        shipId = shipSel.value;
+        if (shipId) {
+          const s = cache.shipments.find(x=>x.id===shipId);
+          const added = shipPoIds(s).filter(id=>!sel.includes(id));
+          added.forEach(addPo);
+          if (added.length) toast('أُضيفت أوامر الشحنة: ' + added.map(id=>cache.orders.find(o=>o.id===id)?.po_number||'—').join('، '));
+        }
+        redrawPos(); suggestStatus();
+      };
+      addSel.onchange = () => { addPo(addSel.value); redrawPos(); };
+    }
+
+    // ----- أحداث الجدول (تفويض) -----
+    itemsEl.addEventListener('input', (e)=>{
+      const tr = e.target.closest('tr[data-key]'); if (!tr) return;
+      const r = rows.get(tr.dataset.key); if (!r) return;
+      if (e.target.classList.contains('wh-rcv')) {
+        r.received = e.target.value;
+        tr.querySelector('.wh-diff').innerHTML = diffHtml(r);
+        const tot = itemsEl.querySelector(`.wh-tot[data-po="${r.po_id}"]`); if (tot) tot.innerHTML = totalsHtml(r.po_id);
+        suggestStatus();
+      } else if (e.target.classList.contains('wh-note')) r.notes = e.target.value;
+      else if (e.target.classList.contains('wh-name')) r.item_name = e.target.value;
+    });
+    itemsEl.addEventListener('click', async (e)=>{
+      const b = e.target.closest('button'); if (!b || !editable && !b.classList.contains('wh-delrow')) return;
+      if (b.classList.contains('wh-fill')) {
+        poRows(b.dataset.po).forEach(r=>{ const x=expOf(r); if (r.received==='' && x>0) r.received = String(x); });
+        redrawPos(); suggestStatus();
+      } else if (b.classList.contains('wh-addrow')) {
+        const key = 'M:new'+(++seq);
+        rows.set(key, { key, po_id:b.dataset.po, po_line_item_id:null, item_name:'', ordered:null, expSaved:null, received:'', notes:'', lineId:null, manual:true });
+        redrawPos();
+      } else if (b.classList.contains('wh-rmrow')) { rows.delete(b.dataset.key); redrawPos(); suggestStatus(); }
+      else if (b.classList.contains('wh-delrow')) {
+        const r = rows.get(b.dataset.key); if (!r?.lineId) return;
+        if (!confirm('حذف هذا البند من الاستلام نهائيًا؟ (أي تعديلات غير محفوظة في هذه النافذة ستضيع)')) return;
+        const { error } = await sb.from('erp_warehouse_receipt_lines').delete().eq('id', r.lineId);
+        if (error) { toast('خطأ: '+error.message); return; }
+        await refreshAll(); renderActiveTab();
+        openWarehouseReceiptModal(cache.warehouseReceipts.find(x=>x.id===receipt.id));
+      }
+    });
+    chipsEl.addEventListener('click', (e)=>{
+      const b = e.target.closest('.wh-rmpo'); if (!b || b.disabled || !editable) return;
+      const id = b.dataset.po, i = sel.indexOf(id); if (i<0) return;
+      sel.splice(i,1);
+      [...rows.keys()].filter(k=>rows.get(k).po_id===id).forEach(k=>rows.delete(k));
+      redrawPos(); suggestStatus();
+    });
+
+    // ----- الحفظ: الاستلام ثم ربط الأوامر ثم البنود -----
     if (editable) root.querySelector('#save-wh').onclick = async () => {
+      if (!sel.length && !(isEdit && originallyNoPo)) { toast('اختر أمر شراء واحدًا على الأقل'); return; }
+      const bad = [...rows.values()].find(r=>{
+        const filled = r.received!=='';
+        if (filled && (isNaN(Number(r.received)) || Number(r.received)<0)) return true;
+        if ((filled || r.lineId) && !String(r.item_name||'').trim()) return true;
+        return false;
+      });
+      if (bad) { toast('راجع الصفوف: الكمية رقم موجب، والصنف اليدوي يحتاج اسمًا'); return; }
+      const btn = root.querySelector('#save-wh'); btn.disabled = true;
       const payload = {
-        po_id: val('wh-po_id')||null, shipment_id: val('wh-shipment_id')||null,
+        po_id: sel[0]||null, shipment_id: shipId||null,
         warehouse_location: val('wh-warehouse_location')||null,
         received_date: val('wh-received_date')||null,
         received_by_name: val('wh-received_by_name')||null,
         status: val('wh-status'), condition_status: val('wh-condition_status')||null, notes: val('wh-notes')||null,
       };
+      let rid = receipt?.id || null;
       try {
         if (isEdit) {
-          const { error } = await sb.from('erp_warehouse_receipts').update(payload).eq('id', receipt.id);
+          const { error } = await sb.from('erp_warehouse_receipts').update(payload).eq('id', rid);
           if (error) throw error;
-          toast('تم الحفظ'); closeModal(); await refreshAll(); renderActiveTab();
         } else {
           payload.created_by = currentUser.id;
-          const { data: newReceipt, error } = await sb.from('erp_warehouse_receipts').insert(payload).select().single();
+          const { data: nr, error } = await sb.from('erp_warehouse_receipts').insert(payload).select().single();
           if (error) throw error;
-          await refreshAll(); renderActiveTab();
-          toast('تم الحفظ — يمكنك الآن إضافة بنود الاستلام وإرفاق صور');
-          openWarehouseReceiptModal(cache.warehouseReceipts.find(r=>r.id===newReceipt.id));
+          rid = nr.id;
         }
-      } catch(e){ toast('خطأ: '+e.message); }
+        // ربط الأوامر
+        const have = cache.warehouseReceiptPos.filter(x=>x.receipt_id===rid).map(x=>x.po_id);
+        const toAdd = sel.filter(id=>!have.includes(id)), toDel = have.filter(id=>!sel.includes(id));
+        if (toAdd.length) {
+          const { error } = await sb.from('erp_warehouse_receipt_pos').insert(toAdd.map(po_id=>({ receipt_id:rid, po_id, created_by:currentUser.id })));
+          if (error) throw error;
+        }
+        for (const po_id of toDel) {
+          const { error } = await sb.from('erp_warehouse_receipt_pos').delete().eq('receipt_id', rid).eq('po_id', po_id);
+          if (error) throw error;
+        }
+        // البنود
+        const inserts = [], updates = [];
+        [...rows.values()].forEach(r=>{
+          const filled = r.received!=='';
+          const e = expOf(r);
+          const rec = filled ? Number(r.received) : 0;
+          const notes = (r.notes||'').trim() || null;
+          if (r.lineId) {
+            const old = existingLines.find(l=>l.id===r.lineId);
+            const same = old && Number(old.received_quantity)===rec && (old.discrepancy_notes||null)===notes
+              && (old.ordered_quantity!=null?Number(old.ordered_quantity):null)===(e!=null?e:null)
+              && old.po_id===r.po_id && old.item_name===r.item_name;
+            if (!same) updates.push({ id:r.lineId, patch:{ po_id:r.po_id, item_name:r.item_name.trim(), ordered_quantity:e, received_quantity:rec, discrepancy_notes:notes } });
+          } else if (filled) {
+            inserts.push({ receipt_id:rid, po_id:r.po_id, po_line_item_id:r.po_line_item_id, item_name:r.item_name.trim(),
+              ordered_quantity:e, received_quantity:rec, discrepancy_notes:notes, created_by:currentUser.id });
+          }
+        });
+        if (inserts.length) { const { error } = await sb.from('erp_warehouse_receipt_lines').insert(inserts); if (error) throw error; }
+        for (const u of updates) { const { error } = await sb.from('erp_warehouse_receipt_lines').update(u.patch).eq('id', u.id); if (error) throw error; }
+
+        await refreshAll(); renderActiveTab();
+        if (isEdit) { toast('تم الحفظ'); closeModal(); }
+        else { toast('تم الحفظ — يمكنك الآن إرفاق صور حالة البضاعة'); openWarehouseReceiptModal(cache.warehouseReceipts.find(r=>r.id===rid)); }
+      } catch(err) {
+        btn.disabled = false;
+        if (rid && !isEdit) { // الاستلام اتسجّل قبل الخطأ: نفتحه للتعديل حتى لا يتكرر
+          await refreshAll(); renderActiveTab();
+          toast('تم حفظ الاستلام لكن حدث خطأ في جزء منه: ' + (err.message||err) + ' — راجع البيانات واحفظ مرة أخرى');
+          openWarehouseReceiptModal(cache.warehouseReceipts.find(r=>r.id===rid));
+        } else toast('خطأ: ' + (err.message||err));
+      }
     };
     if (isEdit && canDelete()) root.querySelector('#del-wh').onclick = async () => {
       if (!confirm('حذف استلام المستودع وكل بنوده؟')) return;
@@ -2849,10 +3047,7 @@ function openWarehouseReceiptModal(receipt){
       if (error) { toast('خطأ: '+error.message); return; }
       toast('تم الحذف'); closeModal(); await refreshAll(); renderActiveTab();
     };
-    if (isEdit) {
-      wireReceiptLinesBlock(root, receipt);
-      wireAttachmentsBlock(root, 'receipt', receipt.id, () => openWarehouseReceiptModal(cache.warehouseReceipts.find(r=>r.id===receipt.id)));
-    }
+    if (isEdit) wireAttachmentsBlock(root, 'receipt', receipt.id, () => openWarehouseReceiptModal(cache.warehouseReceipts.find(r=>r.id===receipt.id)));
   });
 }
 
@@ -2945,7 +3140,7 @@ const TABLE_LABELS = {
   erp_suppliers:'الموردون', erp_purchase_orders:'أوامر الشراء', erp_po_line_items:'بنود الأوامر',
   erp_payments:'الدفعات', erp_shipments:'الشحنات', erp_shipment_items:'أصناف الشحنات', erp_shipment_containers:'حاويات الشحنات', erp_season_plan:'خطة الموسم',
   erp_attachments:'المرفقات', erp_samples:'العينات',
-  erp_warehouse_receipts:'استلام المستودع', erp_warehouse_receipt_lines:'بنود استلام المستودع',
+  erp_warehouse_receipts:'استلام المستودع', erp_warehouse_receipt_lines:'بنود استلام المستودع', erp_warehouse_receipt_pos:'أوامر الاستلام',
   erp_profiles:'الحسابات', erp_accounts:'حذف حساب', erp_payment_comments:'تعليقات الدفعات',
 };
 function renderAudit(root){
@@ -3059,7 +3254,7 @@ const BACKUP_TABLES = [
   ['erp_payments','الدفعات'], ['erp_payment_comments','تعليقات الدفعات'],
   ['erp_shipments','الشحنات'], ['erp_shipment_items','أصناف الشحنات'], ['erp_shipment_containers','حاويات الشحنات'],
   ['erp_season_plan','خطة الموسم'], ['erp_samples','العينات'],
-  ['erp_warehouse_receipts','استلام المستودع'], ['erp_warehouse_receipt_lines','بنود الاستلام'],
+  ['erp_warehouse_receipts','استلام المستودع'], ['erp_warehouse_receipt_lines','بنود الاستلام'], ['erp_warehouse_receipt_pos','ربط الاستلام بالأوامر'],
   ['erp_attachments','المرفقات'], ['erp_profiles','الحسابات'],
   ['erp_audit_log','سجل التعديلات'], ['erp_audit_archive','أرشيف السجل'],
 ];
