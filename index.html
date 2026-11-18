@@ -1680,7 +1680,7 @@ function renderAttachmentsBlock(entityType, entityId, attachments){
         `).join('')}
         ${attachments.length===0 ? '<p class="muted">لا توجد مرفقات</p>' : ''}
       </div>
-      ${canWrite() ? `
+      ${(canWrite() || (entityType==='receipt' && canWarehouse())) ? `
       <div class="attach-area" id="attach-drop">
         <p>📎 اسحب الملفات هنا أو <label style="color:var(--primary);cursor:pointer;text-decoration:underline">اختر ملفًا (صورة منتج، أمر استلام، شهادة جمركية، أمر شراء نما...)<input type="file" id="attach-input" style="display:none" multiple></label></p>
         <p class="muted" id="attach-status"></p>
@@ -2668,10 +2668,15 @@ function receiptPoNumbers(r){ return receiptPoIds(r).map(id=>cache.orders.find(o
 function receiptSupplierNames(r){
   return [...new Set(receiptPoIds(r).map(id=>{ const o=cache.orders.find(x=>x.id===id); return o?supplierName(o.supplier_id):null; }).filter(Boolean))];
 }
+function lineExpected(l){
+  const pl = l.po_line_item_id ? cache.lines.find(x=>x.id===l.po_line_item_id) : null;
+  if (pl && pl.quantity!=null) return Number(pl.quantity);
+  return l.ordered_quantity!=null ? Number(l.ordered_quantity) : null;
+}
 function receiptTotals(r){
   const ls = receiptLinesFor(r.id);
   return { n: ls.length,
-    exp: ls.reduce((a,l)=>a+(Number(l.ordered_quantity)||0),0),
+    exp: ls.reduce((a,l)=>a+(lineExpected(l)||0),0),
     rcv: ls.reduce((a,l)=>a+(Number(l.received_quantity)||0),0) };
 }
 
@@ -2727,7 +2732,7 @@ function renderWarehouseReceipts(root){
       if (!ls.length) { rows.push({ ...base, أمر_البند:'', الصنف:'', المتوقع:'', المستلم:'', الفرق:'', ملاحظات_الفرق:'' }); return; }
       ls.forEach(l=>{
         const po = cache.orders.find(o=>o.id===(l.po_id || cache.lines.find(x=>x.id===l.po_line_item_id)?.po_id));
-        const exp = l.ordered_quantity!=null ? Number(l.ordered_quantity) : null;
+        const exp = lineExpected(l);
         rows.push({ ...base, أمر_البند: po?po.po_number:'', الصنف: l.item_name, المتوقع: exp, المستلم: Number(l.received_quantity),
           الفرق: exp!=null ? Number(l.received_quantity)-exp : '', ملاحظات_الفرق: l.discrepancy_notes });
       });
@@ -2777,17 +2782,23 @@ function openWarehouseReceiptModal(receipt){
   }
   sel.forEach(ensureRows);
 
-  // الكمية المتوقعة: كمية هذا الصنف في الشحنة المختارة إن وُجدت أصناف للأمر، وإلا كمية الأمر
-  function shipQty(poId, plId){
+  // الكمية في الشحنة (للعلم فقط): تُطابَق بمعرّف البند ثم بالاسم؛ null = غير معروف، 0 = غير مدرج فعلًا
+  const normName = t => String(t||'').replace(/[\u064B-\u0652\u0640]/g,'').replace(/[أإآ]/g,'ا').replace(/ى/g,'ي').replace(/ة/g,'ه').replace(/\s+/g,' ').trim().toLowerCase();
+  function shipQty(poId, plId, name){
     if (!shipId) return null;
     const its = shipItems(shipId).filter(i=>i.po_id===poId);
     if (!its.length) return null;
-    return its.filter(i=>i.po_line_item_id===plId).reduce((a,i)=>a+(Number(i.quantity)||0),0);
+    const byId = its.filter(i=>plId && i.po_line_item_id===plId);
+    if (byId.length) return byId.reduce((a,i)=>a+(Number(i.quantity)||0),0);
+    const nm = normName(name);
+    const byName = nm ? its.filter(i=>!i.po_line_item_id && normName(i.item_name)===nm) : [];
+    if (byName.length) return byName.reduce((a,i)=>a+(Number(i.quantity)||0),0);
+    return its.some(i=>!i.po_line_item_id) ? null : 0; // بنود شحنة غير مربوطة: لا نجزم بعدم الإدراج
   }
+  // الكمية المتوقعة = كمية بند أمر الشراء (الفرق = المستلم − المطلوب في الأمر)
   function expOf(r){
     if (r.manual) return r.expSaved!=null ? r.expSaved : null;
-    const s = shipQty(r.po_id, r.po_line_item_id);
-    return s!=null ? s : r.ordered;
+    return r.ordered;
   }
   function diffHtml(r){
     if (r.received==='' || isNaN(Number(r.received))) return '<span class="muted">—</span>';
@@ -2797,7 +2808,7 @@ function openWarehouseReceiptModal(receipt){
   }
   function poRows(poId){
     const list = [...rows.values()].filter(r=>r.po_id===poId);
-    const inShip = r => (r.manual || shipQty(r.po_id, r.po_line_item_id)!==0) ? 0 : 1;
+    const inShip = r => (r.manual || shipQty(r.po_id, r.po_line_item_id, r.item_name)!==0) ? 0 : 1;
     return list.sort((a,b)=>inShip(a)-inShip(b)); // الأصناف داخل الشحنة أولاً (الترتيب الأصلي يُحفظ)
   }
   function totalsHtml(poId){
@@ -2814,7 +2825,7 @@ function openWarehouseReceiptModal(receipt){
       const o = cache.orders.find(x=>x.id===poId);
       const showShip = shipColVisible(poId);
       const body = poRows(poId).map(r=>{
-        const sh = r.manual ? null : shipQty(r.po_id, r.po_line_item_id);
+        const sh = r.manual ? null : shipQty(r.po_id, r.po_line_item_id, r.item_name);
         const dim = sh===0 ? 'opacity:.55' : '';
         const nameCell = (r.manual && !r.po_line_item_id) ? `<input class="wh-name" value="${escHtml(r.item_name)}" placeholder="اسم الصنف" ${dis}>` : escHtml(r.item_name) + (sh===0?' <span class="muted">(غير مدرج في الشحنة)</span>':'') + (r.manual?' <span class="badge info">خارج الأمر</span>':'');
         const delBtn = r.lineId ? (canDelete()?`<button type="button" class="btn small wh-delrow" data-key="${r.key}">حذف</button>`:'')
@@ -2880,7 +2891,7 @@ function openWarehouseReceiptModal(receipt){
     <div class="field"><label>ملاحظات</label><textarea id="wh-notes" ${dis}>${escHtml(receipt?.notes||'')}</textarea></div>
 
     <div style="margin-top:6px"><strong>أصناف الاستلام (الكميات الفعلية)</strong>
-      <div class="muted">المتوقع = كمية الصنف في الشحنة المختارة إن وُجدت، وإلا كمية الأمر. اترك الصنف فارغًا إن لم يصل.</div></div>
+      <div class="muted">الفرق = المستلم فعليًا − المطلوب في أمر الشراء (عمود «في الشحنة» للعلم فقط). اترك الصنف فارغًا إن لم يصل.</div></div>
     <div id="wh-items">${itemsHtml()}</div>
 
     ${isEdit ? renderAttachmentsBlock('receipt', receipt.id, attachments) : '<p class="muted" style="margin-top:8px">بعد الحفظ تُفتح النافذة تلقائيًا لإرفاق صور حالة البضاعة.</p>'}
