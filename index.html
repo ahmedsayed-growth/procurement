@@ -519,6 +519,15 @@ function canWarehouse(){ return currentProfile.role === 'warehouse'; }
 function canWriteReceipts(){ return canWrite() || canWarehouse(); } // إضافة استلام
 function canEditReceipts(){ return canEditExisting() || canWarehouse(); } // تعديل استلام محفوظ
 function ownsRow(row){ return row.created_by === currentUser.id || ['owner','editor'].includes(currentProfile.role); }
+// وضع المعاينة (قراءة فقط): للدور الذي لا يعدّل السجل، الضغط على الصف نفسه يفتح نافذة المعاينة
+function wireRowPreview(root, act, readOnly){
+  if (!readOnly) return;
+  root.querySelectorAll(`[data-act="${act}"]`).forEach(b=>{
+    const tr = b.closest('tr'); if (!tr) return;
+    tr.style.cursor = 'pointer'; tr.title = 'اضغط لمعاينة التفاصيل';
+    tr.addEventListener('click', e=>{ if (e.target.closest('a,button,input,select,textarea,label')) return; b.click(); });
+  });
+}
 
 function renderActiveTab(){
   const root = document.getElementById('tab-content');
@@ -1355,7 +1364,7 @@ function renderOrders(root){
               <td>${o.nama_uploaded ? '<span class="badge ok">✓</span>' : '<span class="badge bad">✗</span>'}</td>
               <td>${fmtDate(o.order_date)}</td>
               <td>${lines.length}</td>
-              <td><button class="btn small" data-id="${o.id}" data-act="edit-order">${canEditExisting()?'تعديل':'عرض'}</button></td>
+              <td><button class="btn small" data-id="${o.id}" data-act="edit-order">${canEditExisting()?'تعديل':'👁 معاينة'}</button></td>
             </tr>`;
           }).join('')}
         </tbody>
@@ -1378,6 +1387,7 @@ function renderOrders(root){
   root.querySelectorAll('[data-act="edit-order"]').forEach(b=>{
     b.onclick = () => openOrderModal(cache.orders.find(o=>o.id===b.dataset.id));
   });
+  wireRowPreview(root, 'edit-order', !canEditExisting());
 
   if (fullAccess) {
     const bulkCount = () => root.querySelector('#bulk-count') && (root.querySelector('#bulk-count').textContent = selectedOrderIds.size);
@@ -1424,7 +1434,7 @@ function openOrderModal(order){
   const attachments = isEdit ? attachmentsFor('po', order.id) : [];
 
   openModal(`
-    <h3>${isEdit?'تعديل أمر شراء':'أمر شراء جديد'}</h3>
+    <h3>${isEdit?(editable?'تعديل أمر شراء':'معاينة أمر شراء (عرض فقط)'):'أمر شراء جديد'}</h3>
     <div class="row">
       <div class="field"><label>رقم الأمر</label><input id="f-po_number" value="${order?.po_number||''}" ${editable?'':'disabled'}></div>
       <div class="field"><label>المورد</label><select id="f-supplier_id" ${editable?'':'disabled'}><option value="">—</option>${supplierOptions(order?.supplier_id)}</select></div>
@@ -2117,7 +2127,7 @@ function renderShipments(root){
               <td>${escHtml(s.status)||'—'}</td>
               <td>${trackCell(s)}</td>
               <td>${userLabel(s.updated_by)}</td>
-              <td>${(canAdd||canWarehouse())?`<button class="btn small" data-id="${s.id}" data-act="edit-ship">${canEditExisting()?'تعديل':'عرض'}</button>`:''}</td>
+              <td><button class="btn small" data-id="${s.id}" data-act="edit-ship">${canEditExisting()?'تعديل':'👁 معاينة'}</button></td>
             </tr>`;
           }).join('')}
         </tbody>
@@ -2136,6 +2146,7 @@ function renderShipments(root){
   root.querySelectorAll('[data-act="edit-ship"]').forEach(b=>{
     b.onclick = () => openShipmentModal(cache.shipments.find(s=>s.id===b.dataset.id));
   });
+  wireRowPreview(root, 'edit-ship', !canEditExisting());
   wireBulk(root, 'shipments', list, { table:'erp_shipments', label:'شحنة', plural:'الشحنات', attachType:'shipment', note:'(بحاوياتها وأصنافها ومرفقاتها)' });
 }
 
@@ -2156,7 +2167,7 @@ function openShipmentModal(ship){
   if (!items.length) items.push({ id:null, po_id:'', name:'', qty:'' });
 
   openModal(`
-    <h3>${isEdit?'تعديل شحنة':'شحنة جديدة'}</h3>
+    <h3>${isEdit?(editable?'تعديل شحنة':'معاينة شحنة (عرض فقط)'):'شحنة جديدة'}</h3>
     <div class="field">
       <label>الحاويات (رقم لكل حاوية)</label>
       <div id="s-containers"></div>
@@ -2169,15 +2180,15 @@ function openShipmentModal(ship){
       <p class="muted" style="margin-top:6px">الكمية الإجمالية: <strong id="s-total-qty">0</strong> <span>(مجموع كميات الأصناف)</span></p>
     </div>
     <div class="row">
-      <div class="field"><label>شركة الشحن</label><input id="s-shipping_line" list="ship-lines" value="${escHtml(ship?.shipping_line)}" placeholder="مثال: MSC, CMA CGM, ESL"><datalist id="ship-lines">${TRACK_CARRIERS.map(c=>`<option value="${c.name}"></option>`).join('')}</datalist></div>
-      <div class="field"><label>تاريخ طلب الحاوية</label><input type="date" id="s-container_order_date" value="${ship?.container_order_date||''}"></div>
+      <div class="field"><label>شركة الشحن</label><input id="s-shipping_line" list="ship-lines" value="${escHtml(ship?.shipping_line)}" placeholder="مثال: MSC, CMA CGM, ESL" ${dis}><datalist id="ship-lines">${TRACK_CARRIERS.map(c=>`<option value="${c.name}"></option>`).join('')}</datalist></div>
+      <div class="field"><label>تاريخ طلب الحاوية</label><input type="date" id="s-container_order_date" value="${ship?.container_order_date||''}" ${dis}></div>
     </div>
-    <div class="field"><label>رقم البوليصة (B/L) أو رابط التتبع</label><input id="s-tracking_url" value="${escHtml(ship?.tracking_url)}" placeholder="مثال: MEDUAFE39772 — أو رابط كامل https://..."><p class="muted" id="s-trk-preview" style="margin-top:4px"></p></div>
+    <div class="field"><label>رقم البوليصة (B/L) أو رابط التتبع</label><input id="s-tracking_url" value="${escHtml(ship?.tracking_url)}" placeholder="مثال: MEDUAFE39772 — أو رابط كامل https://..." ${dis}><p class="muted" id="s-trk-preview" style="margin-top:4px"></p></div>
     <div class="row">
-      ${SHIP_MILESTONES.map(([key,label])=>`<div class="field"><label>${label}</label><input type="date" id="s-${key}" value="${ship?.[key]||''}"></div>`).join('')}
+      ${SHIP_MILESTONES.map(([key,label])=>`<div class="field"><label>${label}</label><input type="date" id="s-${key}" value="${ship?.[key]||''}" ${dis}></div>`).join('')}
     </div>
-    <div class="field"><label>الحالة</label><input id="s-status" value="${escHtml(ship?.status)}"></div>
-    <div class="field"><label>ملاحظات</label><textarea id="s-notes">${escHtml(ship?.notes)}</textarea></div>
+    <div class="field"><label>الحالة</label><input id="s-status" value="${escHtml(ship?.status)}" ${dis}></div>
+    <div class="field"><label>ملاحظات</label><textarea id="s-notes" ${dis}>${escHtml(ship?.notes)}</textarea></div>
     ${isEdit && ship?.updated_by ? `<p class="muted">آخر تحديث بواسطة: ${userLabel(ship.updated_by)}</p>` : ''}
     ${isEdit ? renderAttachmentsBlock('shipment', ship.id, attachments) : '<p class="muted" style="margin-top:8px">📎 اضغط "حفظ" أولاً — ستفتح النافذة تلقائيًا لإرفاق الملفات.</p>'}
     <div class="row" style="margin-top:14px">
@@ -2712,7 +2723,7 @@ function renderWarehouseReceipts(root){
               <td>${r.status||'—'}</td>
               <td>${condBad?`<span class="badge bad">${r.condition_status}</span>`:(r.condition_status||'—')}</td>
               <td>${tot}</td>
-              <td>${canAdd?`<button class="btn small" data-id="${r.id}" data-act="edit-wh">${canEditReceipts()?'تعديل':'عرض'}</button>`:''}</td>
+              <td><button class="btn small" data-id="${r.id}" data-act="edit-wh">${canEditReceipts()?'تعديل':'👁 معاينة'}</button></td>
             </tr>`;
           }).join('')}
         </tbody>
@@ -2743,6 +2754,7 @@ function renderWarehouseReceipts(root){
   root.querySelectorAll('[data-act="edit-wh"]').forEach(b=>{
     b.onclick = () => openWarehouseReceiptModal(cache.warehouseReceipts.find(r=>r.id===b.dataset.id));
   });
+  wireRowPreview(root, 'edit-wh', !canEditReceipts());
   wireBulk(root, 'receipts', cache.warehouseReceipts, { table:'erp_warehouse_receipts', label:'استلام', plural:'استلامات المستودع', attachType:'receipt', note:'(بكل بنودها)' });
 }
 
@@ -2871,7 +2883,7 @@ function openWarehouseReceiptModal(receipt){
   }
 
   openModal(`
-    <h3>${isEdit?(editable?'تعديل استلام مستودع':'عرض استلام مستودع'):'استلام مستودع جديد'}</h3>
+    <h3>${isEdit?(editable?'تعديل استلام مستودع':'معاينة استلام مستودع (عرض فقط)'):'استلام مستودع جديد'}</h3>
     <div class="field"><label>الشحنة (اختياري) — عند اختيارها تُضاف أوامرها تلقائيًا</label>
       <select id="wh-shipment_id" ${dis}><option value="">—</option>${shipOptions()}</select></div>
     <div class="field"><label>أوامر الشراء في هذا الاستلام (يمكن أكثر من أمر)</label>
