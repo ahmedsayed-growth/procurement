@@ -377,6 +377,18 @@ html[dir="rtl"] .stage3d canvas{transform:scaleX(-1)}
 }
 @media(max-width:480px){.topbar .whoami>span{display:none}.topbar h1{font-size:13px}}
 
+/* ===== v2: desktop sidebar navigation (menu on the inline-start side = right in Arabic) ===== */
+@media (min-width:1100px){
+  .container{max-width:none;display:grid;grid-template-columns:224px minmax(0,1fr);column-gap:20px;align-items:start;padding:18px clamp(14px,2vw,32px)}
+  .tabs{position:sticky;top:76px;z-index:40;flex-direction:column;flex-wrap:nowrap;overflow-x:hidden;overflow-y:auto;max-height:calc(100vh - 96px);gap:3px;padding:10px;border-radius:20px;margin:0;scrollbar-width:thin}
+  .tabs button{width:100%;display:flex;align-items:center;justify-content:flex-start;gap:10px;text-align:start;white-space:normal;border-radius:12px;padding:10px 14px;font-weight:500;line-height:1.3}
+  .tabs button:hover:not(.active){background:var(--primary-light)}
+  .tabs button.active{box-shadow:0 8px 18px -8px var(--primary)}
+  #tab-content{min-width:0}
+}
+@media (min-width:1100px) and (max-width:1320px){ .container{grid-template-columns:196px minmax(0,1fr);column-gap:14px} .tabs button{padding:9px 11px;font-size:13px} }
+@media print{.container{display:block}}
+
 </style>
 </head>
 <body>
@@ -555,7 +567,7 @@ async function refreshAll(){
     sb.from('erp_shipments').select('*').order('created_at',{ascending:false}),
     sb.from('erp_season_plan').select('*').order('need_by_date'),
     sb.from('erp_profiles').select('*').order('username'),
-    isOwner ? sb.from('erp_audit_log').select('*').order('changed_at',{ascending:false}).limit(100) : empty,
+    isOwner ? sb.from('erp_audit_log').select('*').order('changed_at',{ascending:false}).limit(1000) : empty,
     sb.from('erp_attachments').select('*').order('created_at',{ascending:false}),
     sb.from('erp_samples').select('*').order('created_at',{ascending:false}),
     sb.from('erp_warehouse_receipts').select('*').order('created_at',{ascending:false}),
@@ -4019,7 +4031,7 @@ window.I18N_EN = {
   });
   document.addEventListener('keydown',e=>{ if((e.key==='Enter'||e.key===' ')&&e.target.matches&&e.target.matches('.kpi-card[data-go]')){ e.preventDefault(); e.target.click(); } });
   window.goTab = function(tab, stage){
-    window.LG_FILTER = stage||'';
+    window.LG_FILTER = stage||''; if(tab!=='orders') window.LG_PO_FILTER='';
     if(typeof TAB_DEFS!=='undefined' && !TAB_DEFS.some(t=>t.id===tab && t.roles.includes(currentProfile.role))) return;
     activeTab=tab; renderTabs(); renderActiveTab(); window.scrollTo({top:0,behavior:reducedMotion()?'auto':'smooth'});
   };
@@ -4305,6 +4317,8 @@ window.Stage = (function(){
   const esc=v=>escHtml(v);
 
   const ST={
+    planned:{c:'#94a3b8',icon:'📝',ar:'مخطط',en:'Planned'},
+    confirmed:{c:'#6366f1',icon:'🤝',ar:'مؤكد — بانتظار الإنتاج',en:'Confirmed — awaiting production'},
     production:{c:'var(--st-production)',icon:'🏭',ar:'قيد الإنتاج',en:'In production'},
     ready:{c:'var(--st-ready)',icon:'📦',ar:'جاهزة للشحن',en:'Ready to ship'},
     sea:{c:'var(--st-sea)',icon:'🚢',ar:'في البحر',en:'At sea'},
@@ -4312,36 +4326,72 @@ window.Stage = (function(){
     cleared:{c:'var(--st-cleared)',icon:'🚚',ar:'مُخلَّصة — للمستودع',en:'Cleared · to warehouse'},
     received:{c:'var(--st-received)',icon:'✅',ar:'مُستلمة',en:'Received'},
   };
-  const ORDER=['production','ready','sea','port','cleared','received'];
+  const ORDER=['production','ready','sea','port','cleared','received'];      // shipment stages
+const PO_ORDER=['planned','confirmed','production','ready','sea','port','cleared','received']; // order stages
+const DATA_FLAGS=new Set(['track','rcvdate','atadate','cldate','rcmismatch','rcsync']);                 // data-gap flags (not operational problems)
+const PO_MAP={'مخطط':'planned','مؤكد':'confirmed','قيد الإنتاج':'production','شُحن':'sea','وصل':'port','مُستلم':'received'};
+// Shipment.status is FREE TEXT typed by the team ("شحن في البحر", "ف الميناء بانتظار التخليص", "تم الاستلام في المستودع"…)
+function statusStage(txt){
+  const t=String(txt||'').replace(/[\u064B-\u065F\u0640]/g,'').trim(); if(!t) return null;
+  if(/تم\s*الاستلام|استلام.*مستودع|^مستلم/.test(t)) return 'received';
+  if(/تم\s*التخليص|مخلص/.test(t)) return 'cleared';
+  if(/ميناء|تخليص/.test(t)) return 'port';
+  if(/بحر|يحر|شحن|طريق/.test(t)) return 'sea';
+  if(/جاهز|فحص/.test(t)) return 'ready';
+  if(/انتاج|إنتاج|تصنيع|مصنع/.test(t)) return 'production';
+  return null;
+}
   const stLabel=k=>T(ST[k].ar,ST[k].en);
 
   function derive(s){
-    const t=today(), shipped=dd(s.shipped_date), eta=dd(s.eta_date), ata=dd(s.ata_date), cl=dd(s.customs_cleared_date), rcv=dd(s.received_date);
-    let key='production';
-    if(rcv||s.status==='مُستلم') key='received'; else if(cl) key='cleared'; else if(ata) key='port'; else if(shipped) key='sea';
-    else if(s.production_done_date||s.inspection_date) key='ready';
-    const o={s,key,flags:[],etaDays:null,near:false,late:false,progress:null,indicative:false,containers:shipContainerList(s).length};
+    const t=today(), shipped=dd(s.shipped_date), eta=dd(s.eta_date), ata=dd(s.ata_date), cl=dd(s.customs_cleared_date);
+    // Warehouse receipts are the source of truth for "received": the warehouse team records the real date + quantities
+    const rcs=(cache.warehouseReceipts||[]).filter(r=>r.shipment_id===s.id&&r.received_date);
+    const rcFull=rcs.filter(r=>r.status!=='مستلم جزئياً');
+    const rcDate=rcs.length?rcs.map(r=>r.received_date).sort().slice(-1)[0]:null;
+    const rcDateFull=rcFull.length?rcFull.map(r=>r.received_date).sort().slice(-1)[0]:null;   // partial receipts do not close a shipment
+    const rcv=dd(s.received_date)||dd(rcDateFull);
+    // 1) stage from the status text the team maintains; 2) stage from milestone dates; 3) take the more advanced of the two
+    const st=statusStage(s.status);
+    let ds='production';
+    if(rcv) ds='received'; else if(cl) ds='cleared'; else if(ata) ds='port'; else if(shipped) ds='sea';
+    else if(s.production_done_date||s.inspection_date) ds='ready';
+    const dateHasInfo=!!(rcv||cl||ata||shipped||s.production_done_date||s.inspection_date);
+    let key=st||ds; if(st&&dateHasInfo&&ORDER.indexOf(ds)>ORDER.indexOf(st)) key=ds;
+    if(rcFull.length) key='received'; else if(rcs.length&&ORDER.indexOf(key)<ORDER.indexOf('cleared')) key='cleared';
+    const o={s,key,flags:[],etaDays:null,near:false,late:false,progress:null,indicative:false,containers:shipContainerList(s).length,statusKey:st,dateKey:dateHasInfo?ds:null,rcDate,rcN:rcs.length,rcPartial:rcs.length>0&&!rcFull.length};
     if(key==='sea'){
       if(eta){ o.etaDays=diff(t,eta); o.late=o.etaDays<0; o.near=!o.late&&o.etaDays<=NEAR_DAYS; const tot=diff(shipped,eta); o.progress=tot>0?Math.min(1,Math.max(0,diff(shipped,t)/tot)):(o.late?1:.5); }
       else { o.progress=.5; o.indicative=true; }
     }
     const F=(k,ar,en)=>o.flags.push({k,ar,en});
-    if(key==='sea'&&o.late) F('late',`تجاوزت ETA بـ ${-o.etaDays} يوم`,`${-o.etaDays}d past ETA`);
+    if(key==='sea'&&o.late) F('late',`تجاوزت ETA بـ ${-o.etaDays} يوم — حدّث الحالة لو وصلت`,`${-o.etaDays}d past ETA — update status if it arrived`);
     if(key==='sea'&&!eta) F('noeta','بدون ETA','No ETA');
-    if(key==='port'){ const n=diff(ata,t); if(n>PORT_WARN_DAYS) F('port',`بالميناء ${n} يوم بدون تخليص`,`${n}d at port, not cleared`); }
-    if(key==='cleared'){ const n=diff(cl,t); if(n>WH_WARN_DAYS) F('wh',`مُخلَّصة منذ ${n} يوم ولم تُستلم`,`Cleared ${n}d ago, not received`); }
+    if(st&&dateHasInfo&&ORDER.indexOf(ds)>ORDER.indexOf(st)) F('stale','الحالة النصية أقدم من التواريخ — حدّثها','Status text is behind the dates — update it');
+    if(key==='port'&&ata){ const n=diff(ata,t); if(n>PORT_WARN_DAYS) F('port',`بالميناء ${n} يوم بدون تخليص`,`${n}d at port, not cleared`); }
+    if(key==='cleared'&&cl){ const n=diff(cl,t); if(n>WH_WARN_DAYS) F('wh',`مُخلَّصة منذ ${n} يوم ولم تُستلم`,`Cleared ${n}d ago, not received`); }
     if(key==='sea'&&!String(s.tracking_url||'').trim()) F('track','بدون مرجع تتبع (B/L)','No tracking ref (B/L)');
     if(key!=='received'&&!o.containers) F('cont','بدون رقم حاوية','No container number');
     if(key!=='received'&&shipItems(s.id).length===0&&!s.po_id) F('items','غير مرتبطة بأمر/أصناف','Not linked to an order/items');
-    const dts=[s.shipped_date,s.eta_date,s.ata_date,s.customs_cleared_date,s.received_date];
     if((ata&&shipped&&ata<shipped)||(rcv&&ata&&rcv<ata)||(cl&&ata&&cl<ata)) F('order','ترتيب تواريخ غير منطقي','Date order looks wrong');
+    if(rcs.length){
+      if(s.received_date&&rcDate&&s.received_date!==rcDate) F('rcmismatch',`تاريخ الاستلام بالشحنة (${s.received_date}) يخالف استلام المستودع (${rcDate}) — المعتمد: المستودع`,`Shipment received date (${s.received_date}) differs from the warehouse receipt (${rcDate}) — warehouse is the reference`);
+      if(rcFull.length&&st!=='received') F('rcsync','حالة الشحنة النصية لم تُحدَّث — اعتُمد استلام المستودع','Shipment status text not updated — warehouse receipt used');
+      if(o.rcPartial) F('rcpartial','استلام جزئي في المستودع — بانتظار الباقي','Partial warehouse receipt — remainder pending');
+    }
+    // data gaps: the stage is known from the status text but the matching date was never entered
+    if(key==='received'&&!rcv) F('rcvdate','مستلمة بدون تاريخ استلام','Received but no receiving date');
+    if((key==='port'||key==='cleared'||key==='received')&&!ata) F('atadate','بدون تاريخ وصول فعلي (ATA)','No actual arrival date (ATA)');
+    if((key==='cleared'||key==='received')&&!cl) F('cldate','بدون تاريخ تخليص','No clearance date');
     return o;
   }
+  const isOp=f=>!DATA_FLAGS.has(f.k);
 
   function metrics(){
     const list=cache.shipments.map(derive), by={}; ORDER.forEach(k=>by[k]=list.filter(x=>x.key===k));
-    const sea=by.sea, flagged=list.filter(x=>x.flags.some(f=>f.k!=='track')&&x.key!=='received');
-    const pairs=(a,b)=>list.map(x=>diff(dd(x.s[a]),dd(x.s[b]))).filter(n=>n!=null&&n>=0);
+    const sea=by.sea, flagged=list.filter(x=>x.flags.some(isOp)&&x.key!=='received'), gaps=list.filter(x=>x.flags.some(f=>DATA_FLAGS.has(f.k)&&f.k!=='track'));
+    const val=(x,k)=>k==='received_date'?(x.s.received_date||x.rcDate):x.s[k];
+    const pairs=(a,b)=>list.map(x=>diff(dd(val(x,a)),dd(val(x,b)))).filter(n=>n!=null&&n>=0);
     const arrived=list.filter(x=>x.s.ata_date&&x.s.eta_date);
     const onTime=arrived.filter(x=>dd(x.s.ata_date)<=dd(x.s.eta_date)).length;
     const qty=sea.reduce((a,x)=>a+(Number(shipTotalQty(x.s))||0),0);
@@ -4351,7 +4401,8 @@ window.Stage = (function(){
     const damaged=rc.filter(r=>r.condition_status&&r.condition_status!=='سليمة بالكامل').length;
     const shippedIds=new Set(); cache.shipments.forEach(s=>shipPoIds(s).forEach(id=>shippedIds.add(id)));
     const noShip=cache.orders.filter(o=>o.status!=='مُستلم'&&o.status!=='مُلغى'&&o.order_type==='دولي'&&!shippedIds.has(o.id));
-    return {list,by,sea,flagged,total:list.length,
+    const pr=(a,b)=>pairs(a,b);
+    return {list,by,sea,flagged,gaps,total:list.length,trN:pr('shipped_date','ata_date').length,clN:pr('ata_date','customs_cleared_date').length,whN:pr('customs_cleared_date','received_date').length,
       near:sea.filter(x=>x.near),late:sea.filter(x=>x.late),
       contSea:sea.reduce((a,x)=>a+x.containers,0),qtySea:qty,
       transit:avg(pairs('shipped_date','ata_date')),clear:avg(pairs('ata_date','customs_cleared_date')),toWh:avg(pairs('customs_cleared_date','received_date')),
@@ -4397,9 +4448,10 @@ window.Stage = (function(){
       kpi({icon:'📦',value:M.contSea,label:T('حاويات على السفن الآن','Containers at sea now'),color:'blue',go:'shipments',stage:'sea',pct:100}),
       kpi({icon:'🧮',value:M.qtySea,label:T('كمية في الطريق (مجموع كميات الشحنات)','Quantity on the way (sum of shipment qty)'),color:'blue',pct:100,hint:T('وحدات مختلفة قد تُجمع معًا — للاسترشاد','Mixed units may be summed — indicative')}),
       kpi({icon:'🎯',value:M.onTimePct,suffix:M.onTimePct==null?'':'%',label:T(`الوصول في الموعد (من ${M.arrivedN} شحنة)`,`On-time arrival (of ${M.arrivedN} shipments)`),color:M.onTimePct==null?'blue':M.onTimePct>=80?'green':M.onTimePct>=50?'amber':'red',pct:M.onTimePct||0}),
-      kpi({icon:'🌊',value:dayStr(M.transit),suffix:M.transit==null?'':T(' يوم',' d'),label:T('متوسط مدة العبور (شحن ← وصول)','Avg transit (shipped → arrived)'),color:'blue',pct:M.transit?Math.min(100,M.transit/60*100):0}),
-      kpi({icon:'🛃',value:dayStr(M.clear),suffix:M.clear==null?'':T(' يوم',' d'),label:T('متوسط التخليص (وصول ← تخليص)','Avg clearance (arrived → cleared)'),color:M.clear>PORT_WARN_DAYS?'amber':'green',pct:M.clear?Math.min(100,M.clear/20*100):0}),
-      kpi({icon:'🏬',value:dayStr(M.toWh),suffix:M.toWh==null?'':T(' يوم',' d'),label:T('من التخليص للمستودع','Cleared → warehouse'),color:M.toWh>WH_WARN_DAYS?'amber':'green',pct:M.toWh?Math.min(100,M.toWh/15*100):0}),
+      kpi({icon:'🌊',value:dayStr(M.transit),suffix:M.transit==null?'':T(' يوم',' d'),label:T(`متوسط مدة العبور (شحن ← وصول) · ${M.trN} شحنة`,`Avg transit (shipped → arrived) · n=${M.trN}`),color:'blue',pct:M.transit?Math.min(100,M.transit/60*100):0}),
+      kpi({icon:'🛃',value:dayStr(M.clear),suffix:M.clear==null?'':T(' يوم',' d'),label:T(`متوسط التخليص (وصول ← تخليص) · ${M.clN} شحنة`,`Avg clearance (arrived → cleared) · n=${M.clN}`),color:M.clear>PORT_WARN_DAYS?'amber':'green',pct:M.clear?Math.min(100,M.clear/20*100):0}),
+      kpi({icon:'🏬',value:dayStr(M.toWh),suffix:M.toWh==null?'':T(' يوم',' d'),label:T(`من التخليص للمستودع · ${M.whN} شحنة`,`Cleared → warehouse · n=${M.whN}`),color:M.toWh>WH_WARN_DAYS?'amber':'green',pct:M.toWh?Math.min(100,M.toWh/15*100):0}),
+      kpi({icon:'🗂️',value:M.gaps.length,label:T('شحنات حالتها بدون تواريخ مراحل (فجوة بيانات)','Shipments with a status but missing milestone dates (data gap)'),color:M.gaps.length?'amber':'green',go:'shipments',stage:'gaps',pct:pctOf(M.gaps.length,tot),hint:T('مؤشرات المتوسطات والالتزام بالموعد تعتمد على التواريخ — كل ما تُسجَّل أكتر تزيد دقتها','Averages and on-time rate rely on dates — they get more accurate as dates are entered')}),
       kpi({icon:'🧾',value:M.noShip.length,label:T('أوامر دولية مفتوحة بدون شحنة','Open international POs with no shipment'),color:M.noShip.length?'amber':'green',go:'orders',pct:pctOf(M.noShip.length,cache.orders.length)}),
     ];
     const C=[
@@ -4458,7 +4510,7 @@ window.Stage = (function(){
   function checkHtml(M){
     const rows=M.flagged.slice(0,8);
     return `<div class="radar"><h4>🔎 ${T('تحتاج مراجعة','Needs check')} <small>${M.flagged.length}</small></h4>`+
-      (rows.length?rows.map(x=>`<div class="radar-row"><div style="flex:1;min-width:140px">${chip(x)} ${contChips(x.s)}<div style="margin-top:3px">${x.flags.filter(f=>f.k!=='track').map(f=>`<span class="flag-chip">${T(f.ar,f.en)}</span>`).join(' ')}</div></div></div>`).join(''):`<div class="empty-note">✅ ${T('لا توجد شحنات تحتاج مراجعة','Nothing needs checking')}</div>`)+`</div>`;
+      (rows.length?rows.map(x=>`<div class="radar-row"><div style="flex:1;min-width:140px">${chip(x)} ${contChips(x.s)}<div style="margin-top:3px">${x.flags.filter(isOp).map(f=>`<span class="flag-chip">${T(f.ar,f.en)}</span>`).join(' ')}</div></div></div>`).join(''):`<div class="empty-note">✅ ${T('لا توجد شحنات تحتاج مراجعة','Nothing needs checking')}</div>`)+`</div>`;
   }
   function seaBoxHtml(M){
     const rows=M.sea.slice().sort((a,b)=>(a.etaDays==null)-(b.etaDays==null)||a.etaDays-b.etaDays);
@@ -4492,8 +4544,9 @@ window.Stage = (function(){
       `<div class="lg-two">${radarHtml(M)}${checkHtml(M)}</div>`+
       sec(T('أداء اللوجستيات','Logistics performance'),T('متوسطات محسوبة من التواريخ المسجّلة','averages calculated from recorded dates'))+kpiGrid(K.B)+
       sec(T('استلام المستودع','Warehouse receiving'))+kpiGrid(K.C)+
+      sec(T('الأوامر حسب المرحلة','Orders by stage'),T('حالة الأمر مُطابَقة مع شحناته','order status reconciled with its shipments'))+poPipelineHtml(poStats(),'')+
       sec(T('الأوامر والمشتريات','Orders & procurement'),T('تتأثر بالفلاتر أدناه','affected by the filters below'));
-    filterCard.before(w); wirePipeline(w); mountStage(M,'all');
+    filterCard.before(w); wirePipeline(w); wirePoPipeline(w); mountStage(M,'all');
   }
   function enhanceShipments(root,M){
     const card=root.querySelector('.card'); if(!card) return;
@@ -4501,7 +4554,7 @@ window.Stage = (function(){
     const f=window.LG_FILTER||'';
     w.innerHTML=stageHtml(M,{compact:true,title:T('🌊 الشحنات في الطريق','🌊 Shipments in transit'),sub:`${M.sea.length} ${T('في البحر','at sea')}`})+pipelineHtml(M,f)+
       `<div class="lg-two">${seaBoxHtml(M)}${whBoxHtml(M)}</div>`+
-      (f?`<div class="card" style="padding:10px 14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap"><span>🔍 ${T('تصفية','Filter')}:</span>${f==='near'?`<span class="stage-chip" style="--c:var(--st-near)">${T('قاربت الوصول','Near arrival')}</span>`:f==='late'?`<span class="stage-chip" style="--c:var(--st-late)">${T('متأخرة','Past ETA')}</span>`:f==='check'?`<span class="stage-chip" style="--c:var(--st-late)">${T('تحتاج مراجعة','Needs check')}</span>`:`<span class="stage-chip" style="--c:${ST[f].c}">${stLabel(f)}</span>`}<button class="btn small" id="lg-clear">${T('مسح التصفية','Clear filter')}</button></div>`:'');
+      (f?`<div class="card" style="padding:10px 14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap"><span>🔍 ${T('تصفية','Filter')}:</span>${f==='near'?`<span class="stage-chip" style="--c:var(--st-near)">${T('قاربت الوصول','Near arrival')}</span>`:f==='late'?`<span class="stage-chip" style="--c:var(--st-late)">${T('متأخرة','Past ETA')}</span>`:f==='check'?`<span class="stage-chip" style="--c:var(--st-late)">${T('تحتاج مراجعة','Needs check')}</span>`:f==='gaps'?`<span class="stage-chip" style="--c:var(--st-near)">${T('فجوة بيانات','Data gap')}</span>`:`<span class="stage-chip" style="--c:${ST[f].c}">${stLabel(f)}</span>`}<button class="btn small" id="lg-clear">${T('مسح التصفية','Clear filter')}</button></div>`:'');
     card.before(w); wirePipeline(w); growBars(w); mountStage(M,'sea');
     const clr=w.querySelector('#lg-clear'); if(clr) clr.onclick=()=>goTab('shipments','');
     // decorate table rows
@@ -4511,10 +4564,10 @@ window.Stage = (function(){
     let shown=0;
     table.querySelectorAll('tbody tr').forEach(tr=>{
       const btn=tr.querySelector('[data-act="edit-ship"]'); const x=btn&&byId.get(btn.dataset.id); if(!x) return;
-      const pass=!f||(f==='near'?x.near:f==='late'?x.late:f==='check'?x.flags.some(g=>g.k!=='track')&&x.key!=='received':f==='production'?(x.key==='production'||x.key==='ready'):x.key===f);
+      const pass=!f||(f==='near'?x.near:f==='late'?x.late:f==='check'?x.flags.some(isOp)&&x.key!=='received':f==='gaps'?x.flags.some(g=>DATA_FLAGS.has(g.k)&&g.k!=='track'):f==='production'?(x.key==='production'||x.key==='ready'):x.key===f);
       if(!pass){ tr.style.display='none'; return; } shown++;
       if(hi>=0&&tr.children[hi]){ const td=tr.children[hi]; const on=SHIP_MILESTONES.filter(m=>x.s[m[0]]).length;
-        td.insertAdjacentHTML('afterbegin',chip(x)+(x.flags.some(g=>g.k!=='track')&&x.key!=='received'?`<span class="flag-chip" title="${esc(x.flags.filter(g=>g.k!=='track').map(g=>T(g.ar,g.en)).join(' · '))}">${T('تشيك','check')}</span>`:'')+'<br>');
+        td.insertAdjacentHTML('afterbegin',chip(x)+(x.flags.some(isOp)&&x.key!=='received'?`<span class="flag-chip" title="${esc(x.flags.filter(isOp).map(g=>T(g.ar,g.en)).join(' · '))}">${T('تشيك','check')}</span>`:'')+'<br>');
         td.insertAdjacentHTML('beforeend',`<div class="ms-strip" aria-hidden="true">${SHIP_MILESTONES.map((m,i)=>`<i class="${x.s[m[0]]?'on':''}"></i>`).join('')}</div>`); }
     });
     if(f&&!shown) table.querySelector('tbody').insertAdjacentHTML('beforeend',`<tr><td colspan="${heads.length}" class="empty-note">${T('لا توجد شحنات بهذه الحالة','No shipments in this stage')}</td></tr>`);
@@ -4528,11 +4581,192 @@ window.Stage = (function(){
   }
   function enhanceOrders(root,M){
     const card=root.querySelector('.card'); if(!card) return;
-    const open=cache.orders.filter(o=>o.status!=='مُستلم'&&o.status!=='مُلغى').length;
+    const P=poStats(); const f=window.LG_PO_FILTER||'';
     const w=document.createElement('div'); w.className='lg-wrap'; w.id='lg-wrap';
-    w.innerHTML=stageHtml(M,{compact:true,title:T('🏭 من المصنع إلى بابك','🏭 From the factory to your door'),sub:T(`${open} أمر مفتوح · ${M.noShip.length} دولي بدون شحنة`,`${open} open orders · ${M.noShip.length} international with no shipment`)});
-    card.before(w); mountStage(M,'factory');
+    w.innerHTML=stageHtml(M,{compact:true,title:T('🏭 من المصنع إلى بابك','🏭 From the factory to your door'),sub:T(`${P.open.length} أمر مفتوح · ${M.noShip.length} دولي بدون شحنة`,`${P.open.length} open orders · ${M.noShip.length} international with no shipment`)})+
+      poPipelineHtml(P,f)+
+      `<div class="wh-note" style="margin:-6px 4px 0">${T('مرحلة الأمر = حالة الأمر مُطابَقة مع شحناته (الأبعد تأخرًا يحكم). الأوامر المحلية بدون شحنات تُعرض بحالة الأمر اليدوية.','Order stage = the order status reconciled with its shipments (the furthest-behind shipment decides). Local orders without shipments show the manual order status.')}</div>`+
+      (f?`<div class="card" style="padding:10px 14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap"><span>🔍 ${T('تصفية','Filter')}:</span><span class="stage-chip" style="--c:${ST[f].c}">${stLabel(f)}</span><button class="btn small" id="lg-clear">${T('مسح التصفية','Clear filter')}</button></div>`:'');
+    card.before(w); wirePoPipeline(w); mountStage(M,'factory'); decorateOrders(card,P);
+    const clr=w.querySelector('#lg-clear'); if(clr) clr.onclick=()=>{ window.LG_PO_FILTER=''; renderActiveTab(); };
   }
+
+  // ---------- ORDER-level stage (PO status reconciled with its shipments) ----------
+  function poView(o){
+    const ships=cache.shipments.filter(x=>shipPoIds(x).includes(o.id)).map(derive);
+    const base=PO_MAP[o.status]||null; const idx=k=>PO_ORDER.indexOf(k);
+    const t=today(), od=dd(o.order_date), age=od?diff(od,t):null;
+    const sup=cache.suppliers.find(x=>x.id===o.supplier_id), lead=sup&&Number(sup.lead_time_days)>0?Number(sup.lead_time_days):null;
+    const v={o,key:base,ships,rcv:0,age,flags:[],src:'po',cancelled:o.status==='مُلغى',archived:!!o.archived_at};
+    if(v.cancelled) return v;
+    if(ships.length){
+      v.src='ship'; v.rcv=ships.filter(x=>x.key==='received').length;
+      v.key=ships.reduce((a,b)=>PO_ORDER.indexOf(a.key)<=PO_ORDER.indexOf(b.key)?a:b).key;   // furthest-behind shipment decides
+      if(base&&idx(base)>idx(v.key)) v.flags.push({ar:`حالة الأمر (${o.status}) أسبق من الشحنات`,en:`Order status is ahead of its shipments`});
+      if(base&&idx(base)<idx(v.key)) v.flags.push({ar:'حالة الأمر أقدم من الشحنات — حدّثها',en:'Order status is behind its shipments — update it'});
+    } else {
+      if(o.order_type==='دولي'&&base!=='received'&&!v.archived) v.flags.push({ar:'أمر دولي بدون شحنة مرتبطة',en:'International order with no linked shipment'});
+      if((base==='planned'||base==='confirmed')&&age!=null&&lead&&age>lead) v.flags.push({ar:`مرّ ${age} يوم > مهلة المورد (${lead})`,en:`${age}d > supplier lead time (${lead}d)`});
+    }
+    return v;
+  }
+  function poStats(){ const all=cache.orders.map(poView); const by={}; PO_ORDER.forEach(k=>by[k]=all.filter(v=>!v.cancelled&&!v.archived&&v.key===k)); return {all,by,open:all.filter(v=>!v.cancelled&&!v.archived&&v.key!=='received'),archived:all.filter(v=>v.archived).length}; }
+  function poPipelineHtml(P,active,go){
+    return `<div class="pipeline" role="list">`+PO_ORDER.map(k=>`<div class="pl-step ${active===k?'on':''}" role="listitem" style="--c:${ST[k].c}" data-go="${go||'orders'}" data-pstage="${k}" tabindex="0"><div class="n">${P.by[k].length}</div><div class="l">${ST[k].icon} ${stLabel(k)}</div></div>`).join('')+`</div>`;
+  }
+  function wirePoPipeline(root){ root.querySelectorAll('.pl-step[data-pstage]').forEach(p=>{ p.onclick=()=>{ window.LG_PO_FILTER=p.dataset.pstage; goTab('orders',''); }; p.onkeydown=e=>{ if(e.key==='Enter') p.click(); }; }); }
+  function poChip(v){
+    if(v.cancelled) return '';
+    const c=ST[v.key]; if(!c) return '';
+    const extra=v.src==='ship'?` <span class="muted">(${v.rcv}/${v.ships.length} ${T('شحنات مُستلمة','shipments received')})</span>`:(v.age!=null&&(v.key==='confirmed'||v.key==='planned')?` <span class="muted">· ${T(`منذ ${v.age} يوم`,`${v.age}d ago`)}</span>`:'');
+    return `<span class="stage-chip" style="--c:${c.c}">${stLabel(v.key)}</span>${extra}`+(v.flags.length?`<div style="margin-top:3px">${v.flags.map(f=>`<span class="flag-chip">${T(f.ar,f.en)}</span>`).join(' ')}</div>`:'');
+  }
+  function decorateOrders(card,P){
+    const table=card.querySelector('table'); if(!table) return;
+    const heads=[...table.querySelectorAll('thead th')]; const hi=heads.findIndex(h=>/^الحالة$/.test(h.textContent.trim())); if(hi<0) return;
+    const byId=new Map(P.all.map(v=>[v.o.id,v])); const f=window.LG_PO_FILTER||''; let shown=0;
+    table.querySelectorAll('tbody tr').forEach(tr=>{
+      const btn=tr.querySelector('[data-act="edit-order"]'); const v=btn&&byId.get(btn.dataset.id); if(!v) return;
+      if(f&&v.key!==f){ tr.style.display='none'; return; } shown++;
+      const td=tr.children[hi]; if(td) td.insertAdjacentHTML('beforeend','<div style="margin-top:4px">'+poChip(v)+'</div>');
+    });
+    if(f&&!shown) table.querySelector('tbody').insertAdjacentHTML('beforeend',`<tr><td colspan="${heads.length}" class="empty-note">${T('لا توجد أوامر في هذه المرحلة','No orders in this stage')}</td></tr>`);
+  }
+
+  // ---------- ORDER AGING (replaces the original report: reads shipments + warehouse receipts, never reddens closed orders) ----------
+  window.LG_AGING_ARCH=window.LG_AGING_ARCH||false;
+  function agingRows(){
+    const nowD=today();
+    return cache.orders.filter(o=>o.status!=='مُلغى').map(o=>{
+      const v=poView(o), ships=v.ships;
+      const rcvDates=ships.filter(x=>x.key==='received').map(x=>x.s.received_date||x.rcDate).filter(Boolean).sort();
+      const closed=v.archived||o.status==='مُستلم'||(ships.length>0&&v.rcv===ships.length);
+      const rcvDate=closed?(o.received_date||(rcvDates.length?rcvDates[rcvDates.length-1]:null)):null;   // PO-level date (if the column exists) wins
+      const od=dd(o.order_date), needBy=dd(o.need_by_date);
+      let age=null; if(od) age=diff(od,rcvDate?dd(rcvDate):(closed?null:nowD));
+      let sla,cls;
+      if(closed){
+        if(v.archived&&!rcvDate){ sla=T('مؤرشف','Archived'); cls='info'; }
+        else if(age==null){ sla=T('مستلم — بدون تاريخ استلام','Received — no receipt date'); cls='info'; }
+        else if(needBy&&dd(rcvDate)>needBy){ sla=T(`مستلم متأخرًا ${diff(needBy,dd(rcvDate))} يوم`,`Received ${diff(needBy,dd(rcvDate))}d after need-by`); cls='warn'; }
+        else if(needBy){ sla=T('مستلم في الموعد','Received on time'); cls='ok'; }
+        else if(age<=30){ sla=T('سريع','Quick'); cls='ok'; } else if(age<=60){ sla=T('ضمن المعتاد','Normal'); cls='info'; } else { sla=T('مدة طويلة','Long cycle'); cls='warn'; }
+      } else {
+        if(needBy&&nowD>needBy){ sla=T(`مفتوح ومتأخر عن الموعد ${diff(needBy,nowD)} يوم`,`Open · ${diff(needBy,nowD)}d past need-by`); cls='bad'; }
+        else if(!needBy&&age!=null&&age>60){ sla=T('مفتوح > 60 يوم (بدون موعد مطلوب)','Open > 60d (no need-by date)'); cls='bad'; }
+        else { sla=T('مفتوح — ضمن الموعد','Open — within plan'); cls='info'; }
+      }
+      return {o,v,closed,rcvDate,age,sla,cls,needBy:o.need_by_date};
+    }).filter(r=>window.LG_AGING_ARCH||!r.v.archived);
+  }
+  window.renderAging=function(root){
+    const rows=agingRows().sort((a,b)=>(a.closed-b.closed)||((b.age??-1)-(a.age??-1)));
+    const open=rows.filter(r=>!r.closed), closed=rows.filter(r=>r.closed), closedDated=closed.filter(r=>r.age!=null&&r.rcvDate);
+    const avg=closedDated.length?Math.round(closedDated.reduce((x,r)=>x+r.age,0)/closedDated.length):0;
+    const lateOpen=open.filter(r=>r.cls==='bad').length;
+    const noDate=closed.filter(r=>!r.rcvDate&&!r.v.archived).length;
+    const oldest=open.filter(r=>r.age!=null).sort((a,b)=>b.age-a.age)[0];
+    const canAct=['owner','editor'].includes(currentProfile.role), hasArch=cache.orders.some(o=>'archived_at' in o);
+    const archN=cache.orders.filter(o=>o.archived_at).length;
+    root.innerHTML=`
+      <div class="kpi-grid" style="margin-bottom:14px">
+        <div class="kpi-card green"><div class="kpi-icon">📊</div><div class="kpi-value">${avg}</div><div class="kpi-label">${T('متوسط مدة التوريد للأوامر المستلمة (يوم)','Avg. supply time, received orders (days)')} · n=${closedDated.length}</div></div>
+        <div class="kpi-card ${lateOpen?'red':'green'}"><div class="kpi-icon">🚨</div><div class="kpi-value">${lateOpen}</div><div class="kpi-label">${T('أوامر مفتوحة ومتأخرة فعلاً','Open orders truly late')}</div></div>
+        <div class="kpi-card amber"><div class="kpi-icon">⌛</div><div class="kpi-value">${oldest?oldest.age:0}</div><div class="kpi-label">${T('أقدم أمر مفتوح (يوم)','Oldest open order (days)')}${oldest?' — '+(oldest.o.po_number||''):''}</div></div>
+        <div class="kpi-card blue"><div class="kpi-icon">📭</div><div class="kpi-value">${noDate}</div><div class="kpi-label">${T('مستلمة بدون تاريخ استلام (قديمة)','Received without a receipt date (legacy)')}</div></div>
+      </div>
+      <div class="card">
+        <div class="toolbar"><strong>${T('تقرير تقادم أوامر الشراء','Purchase order aging report')} (${rows.length})</strong>
+          <div class="row" style="flex:0;gap:8px">${hasArch?`<label class="muted" style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="ag-arch" ${window.LG_AGING_ARCH?'checked':''}> ${T('عرض المؤرشف','Show archived')} (${archN})</label>`:''}<button class="btn small" id="exp-aging">${T('تصدير إكسل','Export Excel')}</button></div></div>
+        <p class="muted" style="margin-bottom:8px">${T('الاستلام يُقرأ تلقائيًا من شحنات الأمر واستلام المستودع. الأمر المُستلم أو المؤرشف لا يتحوّل أحمر ولا يزيد عمره. الأمر المفتوح يُقاس بموعد الاحتياج (need-by) إن وُجد، وإلا > 60 يوم.','Receipt is read automatically from the order’s shipments and warehouse receipts. A received or archived order never turns red and its age stops growing. Open orders are measured against the need-by date when set, otherwise > 60 days.')}</p>
+        <div style="overflow:auto;max-height:60vh"><table class="rt">
+          <thead><tr><th>${T('رقم الأمر','PO #')}</th><th>${T('المورد','Supplier')}</th><th>${T('النوع','Type')}</th><th>${T('تاريخ الطلب','Order date')}</th><th>${T('الاحتياج','Need by')}</th><th>${T('تاريخ الاستلام','Received')}</th><th>${T('الحالة','Status')}</th><th>${T('المدة (يوم)','Days')}</th><th>${T('التصنيف','Class')}</th>${canAct?'<th></th>':''}</tr></thead>
+          <tbody>${rows.map(r=>`<tr>
+            <td data-label="${T('رقم الأمر','PO #')}">${esc(r.o.po_number||'—')}</td><td data-label="${T('المورد','Supplier')}">${esc(supplierName(r.o.supplier_id))}</td><td data-label="${T('النوع','Type')}">${esc(r.o.order_type||'—')}</td>
+            <td data-label="${T('تاريخ الطلب','Order date')}">${fmtDate(r.o.order_date)}</td><td data-label="${T('الاحتياج','Need by')}">${r.needBy?fmtDate(r.needBy):'—'}</td><td data-label="${T('تاريخ الاستلام','Received')}">${r.rcvDate?fmtDate(r.rcvDate):'—'}</td>
+            <td data-label="${T('الحالة','Status')}">${esc(r.o.status)}${r.v.src==='ship'&&!r.closed?` <span class="muted">(${r.v.rcv}/${r.v.ships.length} ${T('شحنات مُستلمة','received')})</span>`:''}</td>
+            <td data-label="${T('المدة (يوم)','Days')}"><strong>${r.age==null?'—':r.age}</strong></td><td data-label="${T('التصنيف','Class')}"><span class="badge ${r.cls}">${r.sla}</span></td>
+            ${canAct?`<td data-label="">${r.closed?(r.v.archived?`<button class="btn small" data-ag="unarch" data-id="${r.o.id}">${T('إلغاء الأرشفة','Unarchive')}</button>`:(hasArch?`<button class="btn small" data-ag="arch" data-id="${r.o.id}">🗄️ ${T('أرشفة','Archive')}</button>`:'')):`<button class="btn small" data-ag="rcv" data-id="${r.o.id}">✅ ${T('وصل واستُلم','Mark received')}</button>${hasArch?` <button class="btn small" data-ag="arch" data-id="${r.o.id}">🗄️ ${T('أرشفة','Archive')}</button>`:''}`}</td>`:''}
+          </tr>`).join('')}${rows.length===0?`<tr><td colspan="10" class="muted">${T('لا توجد أوامر','No orders')}</td></tr>`:''}</tbody></table></div>
+      </div>`;
+    const cb=root.querySelector('#ag-arch'); if(cb) cb.onchange=()=>{ window.LG_AGING_ARCH=cb.checked; window.renderAging(root); };
+    root.querySelector('#exp-aging').onclick=()=>exportToExcel(rows.map(r=>({رقم_الأمر:r.o.po_number,المورد:supplierName(r.o.supplier_id),النوع:r.o.order_type,تاريخ_الطلب:r.o.order_date,موعد_الاحتياج:r.o.need_by_date,تاريخ_الاستلام:r.rcvDate,الحالة:r.o.status,المدة_بالأيام:r.age,التصنيف:r.sla})),'aging_report');
+    root.querySelectorAll('[data-ag]').forEach(b=>{ b.onclick=async()=>{
+      const o=cache.orders.find(x=>x.id===b.dataset.id); if(!o) return; const act=b.dataset.ag; let patch, msg;
+      if(act==='rcv'){ msg=T(`تأكيد أن الأمر ${o.po_number} وصل واستُلم؟\nسيتغيّر حالة الأمر إلى «مُستلم» ويُحتسب مغلقًا (بدون تأخير). التعديل يُسجَّل باسمك في سجل التعديلات.`,`Confirm PO ${o.po_number} has arrived and been received?\nIts status becomes “Received” and it counts as closed (no lateness). The change is logged under your name.`); patch={status:'مُستلم'};
+        if('received_date' in o){ const iso=new Date(Date.now()-new Date().getTimezoneOffset()*6e4).toISOString().slice(0,10); const dv=prompt(T('تاريخ الاستلام الفعلي (YYYY-MM-DD):','Actual receipt date (YYYY-MM-DD):'),iso); if(dv===null) return; if(dv&&!/^\d{4}-\d{2}-\d{2}$/.test(dv)){ toast(T('صيغة التاريخ غير صحيحة','Invalid date format')); return; } if(dv) patch.received_date=dv; } }
+      else if(act==='arch'){ msg=T(`أرشفة الأمر ${o.po_number}؟ يختفي من القوائم المفتوحة ويمكن استرجاعه.`,`Archive PO ${o.po_number}? It leaves open lists and can be restored.`); patch={archived_at:new Date().toISOString(),archived_by:currentUser.id}; }
+      else { msg=T(`إلغاء أرشفة الأمر ${o.po_number}؟`,`Unarchive PO ${o.po_number}?`); patch={archived_at:null,archived_by:null}; }
+      if(!confirm(msg)) return;
+      const {error}=await sb.from('erp_purchase_orders').update(patch).eq('id',o.id);
+      if(error){ toast((T('تعذّر الحفظ: ','Save failed: '))+error.message); return; }
+      toast(T('تم الحفظ ✓','Saved ✓')); await refreshAll(); renderActiveTab();
+    }; });
+  };
+
+  // ---------- AUDIT LOG v2: readable "what changed", filters, attachments included ----------
+  const AUD_FIELDS={status:['الحالة','Status'],eta_date:['ETA','ETA'],ata_date:['الوصول الفعلي','ATA'],shipped_date:['تاريخ الشحن','Shipped'],customs_cleared_date:['التخليص','Cleared'],received_date:['تاريخ الاستلام','Received date'],need_by_date:['تاريخ الاحتياج','Need-by'],order_date:['تاريخ الطلب','Order date'],notes:['ملاحظات','Notes'],container_contents:['محتوى الحاويات','Container contents'],container_number:['رقم الحاوية','Container #'],tracking_url:['التتبع','Tracking'],shipping_line:['خط الشحن','Shipping line'],total_quantity:['إجمالي الكمية','Total qty'],quantity:['الكمية','Qty'],po_id:['الأمر','PO'],supplier_id:['المورد','Supplier'],amount:['المبلغ','Amount'],due_date:['الاستحقاق','Due'],paid_date:['تاريخ السداد','Paid'],condition_status:['حالة الاستلام','Condition'],archived_at:['الأرشفة','Archived'],received_quantity:['المستلم','Received qty'],discrepancy_notes:['ملاحظات الفروقات','Discrepancy notes']};
+  const AUD_SKIP=new Set(['updated_at','updated_by','created_at','created_by','id']);
+  const audVal=v=>v==null||v===''?'∅':(typeof v==='object'?JSON.stringify(v):String(v));
+  const audShort=(v,n)=>{ v=audVal(v); return v.length>n?v.slice(0,n)+'…':v; };
+  function audRecordLabel(a){
+    const d=a.new_data||a.old_data||{};
+    if(a.table_name==='erp_purchase_orders') return `#${d.po_number||'?'}`;
+    if(a.table_name==='erp_shipments') return audShort(d.container_number||d.id||'',24);
+    if(a.table_name==='erp_shipment_items'||a.table_name==='erp_po_line_items') return audShort(d.item_name||'',24);
+    if(a.table_name==='erp_warehouse_receipts'){ const sh=cache.shipments.find(x=>x.id===d.shipment_id); return sh?audShort(sh.container_number,18):''; }
+    if(a.table_name==='erp_suppliers') return audShort(d.name||'',24);
+    return '';
+  }
+  function audSummary(a){
+    if(a.action==='UPDATE'){
+      const o=a.old_data||{}, n=a.new_data||{}; const keys=Object.keys(n).filter(k=>!AUD_SKIP.has(k)&&JSON.stringify(o[k])!==JSON.stringify(n[k]));
+      if(!keys.length) return T('بدون تغيير فعلي','No effective change');
+      return keys.slice(0,4).map(k=>{ const L=AUD_FIELDS[k]; return `<b>${esc(L?T(L[0],L[1]):k)}</b>: ${esc(audShort(o[k],26))} → ${esc(audShort(n[k],26))}`; }).join('<br>')+(keys.length>4?`<br><span class="muted">+${keys.length-4}</span>`:'');
+    }
+    if(a.action==='INSERT'||a.action==='DELETE'){ const l=audRecordLabel(a); return l?esc(l):''; }
+    return '';
+  }
+  window.LG_AUD_F=window.LG_AUD_F||{user:'',table:'',action:'',q:''};
+  window.renderAudit=function(root){
+    const F=window.LG_AUD_F;
+    const att=(cache.attachments||[]).map(x=>({id:'att-'+x.id,synthetic:true,table_name:'erp_attachments',action:'INSERT',changed_by:x.uploaded_by,changed_at:x.created_at,_att:x}));
+    const all=cache.audit.filter(a=>a.table_name!=='erp_attachments').concat(att).sort((a,b)=>String(b.changed_at).localeCompare(String(a.changed_at)));
+    const users=[...new Set(all.map(a=>a.changed_by).filter(Boolean))], tables=[...new Set(all.map(a=>a.table_name))];
+    const rows=all.filter(a=>(!F.user||a.changed_by===F.user)&&(!F.table||a.table_name===F.table)&&(!F.action||a.action===F.action)&&(!F.q||(JSON.stringify(a.new_data||a._att||'')+JSON.stringify(a.old_data||'')+audRecordLabel(a)).toLowerCase().includes(F.q.toLowerCase())));
+    const act=a=>({INSERT:T('إضافة','Add'),UPDATE:T('تعديل','Edit'),DELETE:T('حذف','Delete'),ACCOUNT_DELETE:T('حذف حساب','Account delete')})[a.action]||a.action;
+    root.innerHTML=`<div class="card">
+      <div class="toolbar"><strong>${T('سجل التعديلات','Audit log')} (${rows.length}/${all.length})</strong>
+        <div class="row" style="flex:0;gap:8px"><button class="btn small danger" id="del-audit" disabled>${T('حذف المحدد','Delete selected')} (0)</button><button class="btn small" id="exp-audit">${T('تصدير إكسل','Export Excel')}</button></div></div>
+      <div class="row" style="gap:8px;flex-wrap:wrap;margin-bottom:10px">
+        <select id="au-user"><option value="">${T('كل المستخدمين','All users')}</option>${users.map(u=>`<option value="${u}" ${F.user===u?'selected':''}>${esc(userLabel(u))}</option>`).join('')}</select>
+        <select id="au-table"><option value="">${T('كل الجداول','All tables')}</option>${tables.map(t=>`<option value="${t}" ${F.table===t?'selected':''}>${esc(TABLE_LABELS[t]||t)}</option>`).join('')}</select>
+        <select id="au-action"><option value="">${T('كل العمليات','All actions')}</option>${['INSERT','UPDATE','DELETE'].map(x=>`<option value="${x}" ${F.action===x?'selected':''}>${act({action:x})}</option>`).join('')}</select>
+        <input id="au-q" placeholder="${T('بحث (رقم أمر، حاوية، ملاحظة…)','Search (PO #, container, note…)')}" value="${esc(F.q)}" style="min-width:200px">
+      </div>
+      <p class="muted" style="margin-bottom:8px">${T('المرفقات تُعرض من جدول المرفقات (الإضافة فقط — الحذف غير مسجَّل).','Attachments are shown from the attachments table (uploads only — deletions are not logged).')}</p>
+      <div style="overflow:auto;max-height:65vh"><table class="rt"><thead><tr><th><input type="checkbox" id="aud-all"></th><th>${T('الوقت','Time')}</th><th>${T('بواسطة','By')}</th><th>${T('الجدول','Table')}</th><th>${T('العملية','Action')}</th><th>${T('ماذا تغيّر','What changed')}</th><th></th></tr></thead><tbody>
+      ${rows.slice(0,400).map(a=>`<tr><td data-label="">${a.synthetic?'':`<input type="checkbox" class="aud-chk" data-id="${a.id}">`}</td>
+        <td data-label="${T('الوقت','Time')}">${new Date(a.changed_at).toLocaleString(document.documentElement.lang==='ar'?'ar-EG-u-nu-latn-ca-gregory':'en-GB')}</td>
+        <td data-label="${T('بواسطة','By')}">${esc(userLabel(a.changed_by))}</td><td data-label="${T('الجدول','Table')}">${esc(TABLE_LABELS[a.table_name]||a.table_name)}</td><td data-label="${T('العملية','Action')}">${act(a)}</td>
+        <td data-label="${T('ماذا تغيّر','What changed')}">${a.synthetic?`📎 ${esc(a._att.file_name||'')} <span class="muted">(${esc(a._att.entity_type||'')})</span>`:audSummary(a)}</td>
+        <td data-label="">${a.synthetic?'':`<button class="btn small" data-id="${a.id}" data-act="view-audit">${T('تفاصيل','Details')}</button>`}</td></tr>`).join('')}
+      ${rows.length>400?`<tr><td colspan="7" class="muted">${T('تُعرض أحدث 400 حركة — ضيّق التصفية لرؤية الباقي.','Showing latest 400 — narrow the filters for more.')}</td></tr>`:''}</tbody></table></div></div>`;
+    const re=()=>window.renderAudit(root);
+    root.querySelector('#au-user').onchange=e=>{F.user=e.target.value;re();}; root.querySelector('#au-table').onchange=e=>{F.table=e.target.value;re();}; root.querySelector('#au-action').onchange=e=>{F.action=e.target.value;re();};
+    const q=root.querySelector('#au-q'); q.onchange=()=>{F.q=q.value;re();};
+    const delBtn=root.querySelector('#del-audit'); const sel=()=>[...root.querySelectorAll('.aud-chk:checked')].map(c=>Number(c.dataset.id));
+    const sync=()=>{ const n=sel().length; delBtn.disabled=n===0; delBtn.textContent=`${T('حذف المحدد','Delete selected')} (${n})`; };
+    root.querySelector('#aud-all').onchange=e=>{ root.querySelectorAll('.aud-chk').forEach(c=>c.checked=e.target.checked); sync(); }; root.querySelectorAll('.aud-chk').forEach(c=>c.onchange=sync);
+    delBtn.onclick=async()=>{ const ids=sel(); if(!ids.length) return; if(!confirm(T(`حذف ${ids.length} حركة من سجل التعديلات؟\nتُنقل إلى أرشيف خاص بالمالك فقط.`,`Delete ${ids.length} log entries? They move to an owner-only archive.`))) return;
+      const {data,error}=await sb.rpc('erp_audit_delete',{p_ids:ids}); if(error){ toast('خطأ: '+error.message); return; } toast(`${data} ✓`); await refreshAll(); renderActiveTab(); };
+    root.querySelector('#exp-audit').onclick=()=>exportToExcel(rows.map(a=>({الوقت:a.changed_at,الجدول:a.table_name,العملية:a.action,بواسطة:userLabel(a.changed_by),السجل:a.synthetic?a._att.file_name:audRecordLabel(a),التغيير:a.synthetic?'':audSummary(a).replace(/<[^>]+>/g,' ')})),'audit_log');
+    root.querySelectorAll('[data-act="view-audit"]').forEach(b=>{ b.onclick=()=>{ const a=cache.audit.find(x=>x.id==b.dataset.id); if(!a) return;
+      openModal(`<h3>${T('تفاصيل الحركة','Entry details')}</h3><p class="muted">${esc(TABLE_LABELS[a.table_name]||a.table_name)} · ${a.action} · ${new Date(a.changed_at).toLocaleString()}</p>
+        ${a.old_data?`<p><strong>${T('قبل','Before')}:</strong></p><pre dir="ltr" style="white-space:pre-wrap;font-size:11px;background:var(--bg);padding:8px;border-radius:6px;overflow:auto;max-height:200px">${esc(JSON.stringify(a.old_data,null,2))}</pre>`:''}
+        ${a.new_data?`<p><strong>${T('بعد','After')}:</strong></p><pre dir="ltr" style="white-space:pre-wrap;font-size:11px;background:var(--bg);padding:8px;border-radius:6px;overflow:auto;max-height:200px">${esc(JSON.stringify(a.new_data,null,2))}</pre>`:''}
+        <button class="btn" id="close-audit" style="margin-top:10px">${T('إغلاق','Close')}</button>`,r=>{ r.querySelector('#close-audit').onclick=closeModal; }); }; });
+  };
 
   // ---------- hook ----------
   const _render=window.renderActiveTab;
